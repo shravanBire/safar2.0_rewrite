@@ -71,6 +71,7 @@ class SafarViewModel(
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), "")
 
     val linkState: StateFlow<LinkState> = repository.linkState
+    val trackerOnline: StateFlow<Boolean?> = repository.trackerOnline
     val historySyncProgress: StateFlow<Int?> = repository.historySyncProgress
     val isDevModeEnabled: StateFlow<Boolean> = repository.isDevModeEnabled
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), false)
@@ -116,6 +117,7 @@ class SafarViewModel(
 
     private var previousPoint: BinaryPacketCodec.ParsedTripPoint? = null
     private var lastLocationDbWriteTime: Long = 0L
+    private var activeConnectedDeviceId: String? = null
 
     @Volatile
     private var lastLivePacketElapsedRealtime: Long = 0L
@@ -134,26 +136,41 @@ class SafarViewModel(
         combine(selectedDevice, mqttBrokerUri, _isSimulatorRunning) { dev, uri, isSim ->
             Triple(dev, uri, isSim)
         },
-        combine(linkState, historySyncProgress, tickerFlow(1000L)) { link, progress, _ ->
-            Pair(link, progress)
+        combine(linkState, trackerOnline, historySyncProgress, tickerFlow(1000L)) { link, online, progress, _ ->
+            Triple(link, online, progress)
         }
-    ) { (device, brokerUri, isSim), (link, progress) ->
+    ) { (device, brokerUri, isSim), (link, online, progress) ->
         when {
             device == null -> ConnectionState.NO_DEVICE
-            brokerUri.isBlank() -> ConnectionState.BROKER_NOT_CONFIGURED
+            brokerUri.isBlank() && !isSim -> ConnectionState.BROKER_NOT_CONFIGURED
             isSim -> ConnectionState.LIVE
             progress != null -> ConnectionState.SYNCING(progress)
             link is LinkState.Error -> ConnectionState.BROKER_ERROR(link.message)
             link is LinkState.Connecting -> ConnectionState.CONNECTING
             link is LinkState.Connected -> {
                 val elapsedSinceLive = SystemClock.elapsedRealtime() - lastLivePacketElapsedRealtime
-                if (lastLivePacketElapsedRealtime > 0L && elapsedSinceLive <= 5000L) {
-                    ConnectionState.LIVE
-                } else {
-                    ConnectionState.WAITING_FOR_TRACKER
+                val isActivelyStreaming = lastLivePacketElapsedRealtime > 0L &&
+                        elapsedSinceLive <= 5000L &&
+                        online != false
+                val hasKnownPosition = _hasLiveData.value || (device.lastLat != null && device.lastLon != null)
+                val lastSeenTs = maxOf(
+                    device.lastSyncedTimestamp,
+                    _liveTelemetry.value?.timestamp ?: 0L
+                ).takeIf { it > 0L }
+
+                when {
+                    isActivelyStreaming -> ConnectionState.LIVE
+                    hasKnownPosition -> ConnectionState.PARKED(lastSeenTs)
+                    else -> ConnectionState.WAITING_FOR_TRACKER
                 }
             }
-            else -> ConnectionState.PARKED(device?.lastSyncedTimestamp)
+            else -> {
+                val lastSeenTs = maxOf(
+                    device.lastSyncedTimestamp,
+                    _liveTelemetry.value?.timestamp ?: 0L
+                ).takeIf { it > 0L }
+                ConnectionState.PARKED(lastSeenTs)
+            }
         }
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), ConnectionState.NO_DEVICE)
 
@@ -214,16 +231,49 @@ class SafarViewModel(
                 previousPoint = telemetryPoint
                 _liveTelemetry.value = telemetryPoint
 
-                val nowSec = System.currentTimeMillis() / 1000
-                if (nowSec - lastLocationDbWriteTime >= 10) {
-                    lastLocationDbWriteTime = nowSec
+                // Persist real tracker coordinates only (never persist Mock Simulator points)
+                if (!_isSimulatorRunning.value) {
+                    val nowSec = System.currentTimeMillis() / 1000
+                    val effectiveTs = if (telemetryPoint.timestamp > 0L) telemetryPoint.timestamp else nowSec
+                    if (lastLocationDbWriteTime == 0L || (nowSec - lastLocationDbWriteTime) >= 10 || telemetryPoint.isTripEnd) {
+                        lastLocationDbWriteTime = nowSec
+                        selectedDevice.value?.let { device ->
+                            repository.updateLastKnownLocation(
+                                deviceId = device.deviceId,
+                                lat = telemetryPoint.latitude,
+                                lon = telemetryPoint.longitude,
+                                speed = telemetryPoint.speedKmh,
+                                timestamp = effectiveTs
+                            )
+                        }
+                    }
+                }
+            }
+        }
+
+        // Collect retained status telemetry from Repository
+        viewModelScope.launch {
+            repository.statusStream.collect { statusPoint ->
+                if (_isSimulatorRunning.value) return@collect
+
+                val currentTs = _liveTelemetry.value?.timestamp ?: 0L
+                val deviceLastTs = selectedDevice.value?.lastSyncedTimestamp ?: 0L
+                val isNewerOrEqual = statusPoint.timestamp >= maxOf(currentTs, deviceLastTs) ||
+                        (_liveTelemetry.value == null && selectedDevice.value?.lastLat == null)
+
+                if (isNewerOrEqual) {
+                    _hasLiveData.value = true
+                    val elapsedSinceLive = SystemClock.elapsedRealtime() - lastLivePacketElapsedRealtime
+                    if (lastLivePacketElapsedRealtime == 0L || elapsedSinceLive > 5000L) {
+                        _liveTelemetry.value = statusPoint
+                    }
                     selectedDevice.value?.let { device ->
                         repository.updateLastKnownLocation(
                             deviceId = device.deviceId,
-                            lat = telemetryPoint.latitude,
-                            lon = telemetryPoint.longitude,
-                            speed = telemetryPoint.speedKmh,
-                            timestamp = nowSec
+                            lat = statusPoint.latitude,
+                            lon = statusPoint.longitude,
+                            speed = statusPoint.speedKmh,
+                            timestamp = statusPoint.timestamp
                         )
                     }
                 }
@@ -281,8 +331,12 @@ class SafarViewModel(
             return
         }
 
-        _liveTripDistanceKm.value = 0.0
-        previousPoint = null
+        if (activeConnectedDeviceId != device.deviceId) {
+            activeConnectedDeviceId = device.deviceId
+            _liveTripDistanceKm.value = 0.0
+            previousPoint = null
+            lastLocationDbWriteTime = 0L
+        }
 
         val currentSource = repository.getTelemetrySource()
         if (currentSource is MqttTelemetrySource &&
@@ -376,6 +430,13 @@ class SafarViewModel(
     // --- UI Actions ---
     fun selectDevice(deviceId: String) {
         viewModelScope.launch {
+            if (selectedDevice.value?.deviceId != deviceId) {
+                _liveTelemetry.value = null
+                _hasLiveData.value = false
+                lastLivePacketElapsedRealtime = 0L
+                lastLocationDbWriteTime = 0L
+                previousPoint = null
+            }
             repository.setSelectedDevice(deviceId)
             _selectedTripId.value = null
         }
@@ -402,6 +463,9 @@ class SafarViewModel(
     fun toggleDevMode(enabled: Boolean) {
         viewModelScope.launch {
             repository.setDevModeEnabled(enabled)
+            if (!enabled && _isSimulatorRunning.value) {
+                toggleSimulator(false)
+            }
         }
     }
 
@@ -435,6 +499,10 @@ class SafarViewModel(
             repository.startSimulator()
         } else {
             repository.stopSimulator()
+            _liveTelemetry.value = null
+            lastLivePacketElapsedRealtime = 0L
+            previousPoint = null
+            _hasLiveData.value = (selectedDevice.value?.lastLat != null && selectedDevice.value?.lastLon != null)
         }
     }
 

@@ -439,8 +439,12 @@ fun SettingScreen(
                                             )
                                         }
                                     }
+                                    val topicId = com.example.safar20.data.network.MqttTelemetrySource.deriveDeviceTopicId(
+                                        device.deviceId,
+                                        device.nostrPubKey
+                                    )
                                     Text(
-                                        text = "ID: ${device.deviceId} • SIM: ${device.simNumber.ifBlank { "N/A" }}",
+                                        text = "ID: ${device.deviceId} • Topic: $topicId • SIM: ${device.simNumber.ifBlank { "N/A" }}",
                                         fontFamily = Inter,
                                         fontSize = 11.sp,
                                         color = MaterialTheme.colorScheme.onSurfaceVariant

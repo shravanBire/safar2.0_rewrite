@@ -57,6 +57,9 @@ class MqttTelemetrySource(
     private val _linkState = MutableStateFlow<LinkState>(LinkState.Idle)
     override val linkState: StateFlow<LinkState> = _linkState.asStateFlow()
 
+    private val _trackerOnline = MutableStateFlow<Boolean?>(null)
+    val trackerOnline: StateFlow<Boolean?> = _trackerOnline.asStateFlow()
+
     private var mqttClient: MqttClient? = null
     @Volatile
     private var isConnected = false
@@ -73,6 +76,19 @@ class MqttTelemetrySource(
     val liveTopic = "safar/v1/$topicDevId/live"
     val histTopic = "safar/v1/$topicDevId/hist"
     val cmdTopic = "safar/v1/$topicDevId/cmd"
+    val presenceTopic = "safar/v1/$topicDevId/presence"
+
+    private val candidateTopicIds: List<String> = buildList {
+        add(topicDevId)
+        val rawId = deviceId.trim().lowercase().replace(" ", "_")
+        if (rawId.isNotBlank() && rawId !in this) add(rawId)
+    }
+
+    private val allStatusTopics = candidateTopicIds.map { "safar/v1/$it/status" }.toSet()
+    private val allLiveTopics = candidateTopicIds.map { "safar/v1/$it/live" }.toSet()
+    private val allHistTopics = candidateTopicIds.map { "safar/v1/$it/hist" }.toSet()
+    private val allPresenceTopics = candidateTopicIds.map { "safar/v1/$it/presence" }.toSet()
+    private val allCmdTopics = candidateTopicIds.map { "safar/v1/$it/cmd" }
 
     override fun isRunning(): Boolean = isConnected
 
@@ -102,7 +118,9 @@ class MqttTelemetrySource(
 
                         scope.launch {
                             try {
-                                client.subscribe(arrayOf(statusTopic, liveTopic, histTopic), intArrayOf(1, 1, 1))
+                                val subTopics = (allStatusTopics + allLiveTopics + allHistTopics + allPresenceTopics).toTypedArray()
+                                val subQos = IntArray(subTopics.size) { 1 }
+                                client.subscribe(subTopics, subQos)
 
                                 val freshLastSynced = lastSyncedProvider?.invoke() ?: 0L
                                 val openSessionPacket = BinaryPacketCodec.encodeOpenSession(
@@ -152,11 +170,13 @@ class MqttTelemetrySource(
     override fun stop() {
         stopHeartbeat()
         _linkState.value = LinkState.Idle
+        _trackerOnline.value = null
         scope.launch {
             try {
                 mqttClient?.let { client ->
                     if (client.isConnected) {
-                        client.unsubscribe(arrayOf(statusTopic, liveTopic, histTopic))
+                        val subTopics = (allStatusTopics + allLiveTopics + allHistTopics + allPresenceTopics).toTypedArray()
+                        client.unsubscribe(subTopics)
                         client.disconnect()
                     }
                     client.close()
@@ -185,8 +205,10 @@ class MqttTelemetrySource(
 
         return try {
             val payloadToSend = CryptoEngine.encryptFrame(commandPacket, sharedSecretHex) ?: return false
-            val message = MqttMessage(payloadToSend).apply { qos = 1 }
-            client.publish(cmdTopic, message)
+            for (targetCmdTopic in allCmdTopics) {
+                val message = MqttMessage(payloadToSend).apply { qos = 1 }
+                client.publish(targetCmdTopic, message)
+            }
             true
         } catch (_: Exception) {
             false
@@ -216,6 +238,12 @@ class MqttTelemetrySource(
         val rawBytes = message.payload ?: return
         if (rawBytes.isEmpty()) return
 
+        if (topic in allPresenceTopics) {
+            val presenceStr = String(rawBytes, Charsets.UTF_8).trim()
+            _trackerOnline.value = (presenceStr == "1")
+            return
+        }
+
         if (!isValidSecretHex(sharedSecretHex)) {
             undecryptableFrameCount++
             return
@@ -234,7 +262,7 @@ class MqttTelemetrySource(
         }
 
         when (topic) {
-            statusTopic -> {
+            in allStatusTopics -> {
                 val livePacket = BinaryPacketCodec.decodeLiveTelemetry(plainData)
                 if (livePacket != null && livePacket.isValidCrc) {
                     if (statusReplayValidator.validateAndRecord(livePacket.tripPoint.timestamp, livePacket.sequenceNumber, checkStale = false)) {
@@ -243,19 +271,21 @@ class MqttTelemetrySource(
                     }
                 }
             }
-            liveTopic -> {
+            in allLiveTopics -> {
                 val livePacket = BinaryPacketCodec.decodeLiveTelemetry(plainData)
                 if (livePacket != null && livePacket.isValidCrc) {
                     if (liveReplayValidator.validateAndRecord(livePacket.tripPoint.timestamp, livePacket.sequenceNumber, checkStale = true)) {
                         lastPacketAcceptedTime = now
+                        _trackerOnline.value = true
                         _liveTelemetryStream.emit(livePacket.tripPoint)
                     }
                 }
             }
-            histTopic -> {
+            in allHistTopics -> {
                 val chunkPacket = BinaryPacketCodec.decodeHistoryChunk(plainData)
                 if (chunkPacket != null && chunkPacket.isValidCrc) {
                     lastPacketAcceptedTime = now
+                    _trackerOnline.value = true
                     val isIngested = onHistoryChunkReceived?.invoke(chunkPacket) ?: true
                     val ackStatus = if (isIngested) 0 else 1
                     val ackPacket = BinaryPacketCodec.encodeHistoryAck(

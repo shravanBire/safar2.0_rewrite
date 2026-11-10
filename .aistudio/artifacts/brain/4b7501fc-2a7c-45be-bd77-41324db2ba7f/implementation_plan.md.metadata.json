@@ -1,0 +1,6 @@
+{
+  "summary":  "Standalone ESP32 Hardware Diagnostic Plan & Test Sketch for NEO-6M/8M GPS (GPIO 16/17) and MPU6050 (GPIO 21/22), including complete pin connection diagram, auto-baud/RX-TX swap detector, raw NMEA & Lat/Lng monitor, and I2C/MPU6050 G-force + tilt test without modifying the Android app.",
+  "updatedAt":  "2026-11-10T19:58:03.626656826Z",
+  "requestFeedback":  true,
+  "userFacing":  true
+}

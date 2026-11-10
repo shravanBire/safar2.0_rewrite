@@ -72,169 +72,190 @@ fun CockpitMapView(
 ) {
     val context = LocalContext.current
 
-    remember {
-        try {
-            MapLibre.getInstance(context)
-        } catch (_: Exception) {
-        }
-    }
-
-    val mapView = remember { MapView(context) }
-    val lifecycleOwner = LocalLifecycleOwner.current
-
     var isFollowingBike by remember { mutableStateOf(true) }
     var isMapError by remember { mutableStateOf(false) }
+
+    val mapView = remember {
+        try {
+            MapLibre.getInstance(context)
+            MapView(context).apply {
+                onCreate(null)
+            }
+        } catch (_: Throwable) {
+            isMapError = true
+            null
+        }
+    }
+    val lifecycleOwner = LocalLifecycleOwner.current
+
+    val latestLat by androidx.compose.runtime.rememberUpdatedState(latitude)
+    val latestLon by androidx.compose.runtime.rememberUpdatedState(longitude)
+    val latestTrackerName by androidx.compose.runtime.rememberUpdatedState(trackerName)
+    val latestRoutePoints by androidx.compose.runtime.rememberUpdatedState(routePoints)
 
     var currentMarker by remember { mutableStateOf<Marker?>(null) }
     var currentPolyline by remember { mutableStateOf<Polyline?>(null) }
     var startMarker by remember { mutableStateOf<Marker?>(null) }
     var endMarker by remember { mutableStateOf<Marker?>(null) }
 
-    DisposableEffect(lifecycleOwner) {
+    val syncMapAnnotations: (MapLibreMap) -> Unit = { map ->
+        val pts = latestRoutePoints
+        val lat = latestLat
+        val lon = latestLon
+        val tName = latestTrackerName
+
+        if (pts.isNotEmpty()) {
+            currentMarker?.let { map.removeAnnotation(it) }
+            currentMarker = null
+
+            currentPolyline?.let { map.removeAnnotation(it) }
+            startMarker?.let { map.removeAnnotation(it) }
+            endMarker?.let { map.removeAnnotation(it) }
+
+            val latLngList = pts.map { LatLng(it.latitude, it.longitude) }
+
+            if (latLngList.size >= 2) {
+                val polylineOptions = PolylineOptions()
+                    .addAll(latLngList)
+                    .color(Color.parseColor("#C86D51"))
+                    .width(6f)
+
+                currentPolyline = map.addPolyline(polylineOptions)
+
+                startMarker = map.addMarker(
+                    MarkerOptions()
+                        .position(latLngList.first())
+                        .title("Trip Start")
+                )
+                endMarker = map.addMarker(
+                    MarkerOptions()
+                        .position(latLngList.last())
+                        .title("Trip End")
+                )
+
+                try {
+                    val boundsBuilder = LatLngBounds.Builder()
+                    latLngList.forEach { boundsBuilder.include(it) }
+                    map.animateCamera(CameraUpdateFactory.newLatLngBounds(boundsBuilder.build(), 100))
+                } catch (_: Exception) {
+                    map.animateCamera(CameraUpdateFactory.newLatLngZoom(latLngList.first(), 14.0))
+                }
+            }
+        } else if (lat != 0.0 && lon != 0.0) {
+            currentPolyline?.let { map.removeAnnotation(it) }
+            startMarker?.let { map.removeAnnotation(it) }
+            endMarker?.let { map.removeAnnotation(it) }
+            currentPolyline = null
+            startMarker = null
+            endMarker = null
+
+            val currentPos = LatLng(lat, lon)
+
+            val marker = currentMarker
+            if (marker != null) {
+                marker.position = currentPos
+                marker.title = tName
+            } else {
+                currentMarker = map.addMarker(
+                    MarkerOptions()
+                        .position(currentPos)
+                        .title(tName)
+                )
+            }
+
+            if (isFollowingBike) {
+                map.animateCamera(CameraUpdateFactory.newLatLngZoom(currentPos, 15.0))
+            }
+        }
+    }
+
+    DisposableEffect(lifecycleOwner, mapView) {
         val observer = LifecycleEventObserver { _, event ->
-            when (event) {
-                Lifecycle.Event.ON_START -> mapView.onStart()
-                Lifecycle.Event.ON_RESUME -> mapView.onResume()
-                Lifecycle.Event.ON_PAUSE -> mapView.onPause()
-                Lifecycle.Event.ON_STOP -> mapView.onStop()
-                Lifecycle.Event.ON_DESTROY -> mapView.onDestroy()
-                else -> {}
+            try {
+                when (event) {
+                    Lifecycle.Event.ON_START -> mapView?.onStart()
+                    Lifecycle.Event.ON_RESUME -> mapView?.onResume()
+                    Lifecycle.Event.ON_PAUSE -> mapView?.onPause()
+                    Lifecycle.Event.ON_STOP -> mapView?.onStop()
+                    Lifecycle.Event.ON_DESTROY -> mapView?.onDestroy()
+                    else -> {}
+                }
+            } catch (_: Throwable) {
+                isMapError = true
             }
         }
         lifecycleOwner.lifecycle.addObserver(observer)
         onDispose {
             lifecycleOwner.lifecycle.removeObserver(observer)
             try {
-                mapView.onPause()
-                mapView.onStop()
-                mapView.onDestroy()
-            } catch (_: Exception) {
+                mapView?.onPause()
+                mapView?.onStop()
+                mapView?.onDestroy()
+            } catch (_: Throwable) {
             }
         }
     }
 
     Box(modifier = modifier) {
-        AndroidView(
-            factory = {
-                mapView.apply {
-                    onCreate(null)
-                    setOnTouchListener { view, event ->
-                        when (event.action) {
+        if (mapView != null && !isMapError) {
+            AndroidView(
+                factory = {
+                    mapView.apply {
+                        setOnTouchListener { view, event ->
+                            when (event.action) {
+                                MotionEvent.ACTION_DOWN, MotionEvent.ACTION_MOVE -> {
+                                    view.parent?.requestDisallowInterceptTouchEvent(true)
+                                }
+                                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                                    view.parent?.requestDisallowInterceptTouchEvent(false)
+                                }
+                            }
+                            false
+                        }
+                        getMapAsync { map ->
+                            map.addOnCameraMoveStartedListener { reason ->
+                                if (reason == MapLibreMap.OnCameraMoveStartedListener.REASON_API_GESTURE) {
+                                    isFollowingBike = false
+                                }
+                            }
+                            map.setStyle(Style.Builder().fromUri("https://tiles.openfreemap.org/styles/liberty")) {
+                                map.uiSettings.isCompassEnabled = false
+                                map.uiSettings.isAttributionEnabled = false
+                                map.uiSettings.isLogoEnabled = false
+
+                                syncMapAnnotations(map)
+                            }
+                            mapView.addOnDidFailLoadingMapListener {
+                                isMapError = true
+                            }
+                        }
+                    }
+                },
+                update = { view ->
+                    view.getMapAsync { map ->
+                        map.getStyle {
+                            syncMapAnnotations(map)
+                        }
+                    }
+                },
+                modifier = Modifier
+                    .fillMaxSize()
+                    .pointerInteropFilter { motionEvent ->
+                        when (motionEvent.action) {
                             MotionEvent.ACTION_DOWN, MotionEvent.ACTION_MOVE -> {
-                                view.parent?.requestDisallowInterceptTouchEvent(true)
+                                mapView.parent?.requestDisallowInterceptTouchEvent(true)
                             }
                             MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
-                                view.parent?.requestDisallowInterceptTouchEvent(false)
+                                mapView.parent?.requestDisallowInterceptTouchEvent(false)
                             }
                         }
                         false
                     }
-                    getMapAsync { map ->
-                        map.addOnCameraMoveStartedListener { reason ->
-                            if (reason == MapLibreMap.OnCameraMoveStartedListener.REASON_API_GESTURE) {
-                                isFollowingBike = false
-                            }
-                        }
-                        map.setStyle(Style.Builder().fromUri("https://tiles.openfreemap.org/styles/liberty")) {
-                            map.uiSettings.isCompassEnabled = false
-                            map.uiSettings.isAttributionEnabled = false
-                            map.uiSettings.isLogoEnabled = false
-
-                            val initialPos = LatLng(latitude, longitude)
-                            map.animateCamera(CameraUpdateFactory.newLatLngZoom(initialPos, 14.0))
-                        }
-                        mapView.addOnDidFailLoadingMapListener {
-                            isMapError = true
-                        }
-                    }
-                }
-            },
-            update = { view ->
-                view.getMapAsync { map ->
-                    map.getStyle {
-                        if (routePoints.isNotEmpty()) {
-                            currentMarker?.let { map.removeAnnotation(it) }
-                            currentMarker = null
-
-                            currentPolyline?.let { map.removeAnnotation(it) }
-                            startMarker?.let { map.removeAnnotation(it) }
-                            endMarker?.let { map.removeAnnotation(it) }
-
-                            val latLngList = routePoints.map { LatLng(it.latitude, it.longitude) }
-
-                            if (latLngList.size >= 2) {
-                                val polylineOptions = PolylineOptions()
-                                    .addAll(latLngList)
-                                    .color(Color.parseColor("#C86D51"))
-                                    .width(6f)
-
-                                currentPolyline = map.addPolyline(polylineOptions)
-
-                                startMarker = map.addMarker(
-                                    MarkerOptions()
-                                        .position(latLngList.first())
-                                        .title("Trip Start")
-                                )
-                                endMarker = map.addMarker(
-                                    MarkerOptions()
-                                        .position(latLngList.last())
-                                        .title("Trip End")
-                                )
-
-                                try {
-                                    val boundsBuilder = LatLngBounds.Builder()
-                                    latLngList.forEach { boundsBuilder.include(it) }
-                                    map.animateCamera(CameraUpdateFactory.newLatLngBounds(boundsBuilder.build(), 100))
-                                } catch (_: Exception) {
-                                    map.animateCamera(CameraUpdateFactory.newLatLngZoom(latLngList.first(), 14.0))
-                                }
-                            }
-                        } else if (latitude != 0.0 && longitude != 0.0) {
-                            currentPolyline?.let { map.removeAnnotation(it) }
-                            startMarker?.let { map.removeAnnotation(it) }
-                            endMarker?.let { map.removeAnnotation(it) }
-                            currentPolyline = null
-                            startMarker = null
-                            endMarker = null
-
-                            val currentPos = LatLng(latitude, longitude)
-
-                            val marker = currentMarker
-                            if (marker != null) {
-                                marker.position = currentPos
-                                marker.title = trackerName
-                            } else {
-                                currentMarker = map.addMarker(
-                                    MarkerOptions()
-                                        .position(currentPos)
-                                        .title(trackerName)
-                                )
-                            }
-
-                            if (isFollowingBike) {
-                                map.animateCamera(CameraUpdateFactory.newLatLngZoom(currentPos, 15.0))
-                            }
-                        }
-                    }
-                }
-            },
-            modifier = Modifier
-                .fillMaxSize()
-                .pointerInteropFilter { motionEvent ->
-                    when (motionEvent.action) {
-                        MotionEvent.ACTION_DOWN, MotionEvent.ACTION_MOVE -> {
-                            mapView.parent?.requestDisallowInterceptTouchEvent(true)
-                        }
-                        MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
-                            mapView.parent?.requestDisallowInterceptTouchEvent(false)
-                        }
-                    }
-                    false
-                }
-        )
+            )
+        }
 
         // Overlay if Map fails to load tiles
-        if (isMapError) {
+        if (isMapError || mapView == null) {
             Box(
                 modifier = Modifier
                     .fillMaxSize()
@@ -262,7 +283,7 @@ fun CockpitMapView(
         }
 
         // Floating Recenter / Follow Bike Button
-        if (routePoints.isEmpty() && !isMapError) {
+        if (routePoints.isEmpty() && !isMapError && mapView != null) {
             Box(
                 modifier = Modifier
                     .align(Alignment.BottomEnd)

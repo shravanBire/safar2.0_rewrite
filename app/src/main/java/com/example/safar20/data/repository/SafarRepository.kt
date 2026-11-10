@@ -56,6 +56,9 @@ class SafarRepository(
     private val _linkState = MutableStateFlow<LinkState>(LinkState.Idle)
     val linkState: StateFlow<LinkState> = _linkState.asStateFlow()
 
+    private val _trackerOnline = MutableStateFlow<Boolean?>(null)
+    val trackerOnline: StateFlow<Boolean?> = _trackerOnline.asStateFlow()
+
     private val _historySyncProgress = MutableStateFlow<Int?>(null)
     val historySyncProgress: StateFlow<Int?> = _historySyncProgress.asStateFlow()
     private var historyProgressJob: Job? = null
@@ -63,6 +66,7 @@ class SafarRepository(
     private var sourceCollectorJob: Job? = null
     private var statusCollectorJob: Job? = null
     private var linkStateCollectorJob: Job? = null
+    private var presenceCollectorJob: Job? = null
 
     init {
         attachTelemetrySource(activeTelemetrySource)
@@ -86,6 +90,7 @@ class SafarRepository(
         sourceCollectorJob?.cancel()
         statusCollectorJob?.cancel()
         linkStateCollectorJob?.cancel()
+        presenceCollectorJob?.cancel()
 
         sourceCollectorJob = repositoryScope.launch {
             source.liveTelemetryStream.collect { point ->
@@ -101,6 +106,15 @@ class SafarRepository(
             source.linkState.collect { state ->
                 _linkState.value = state
             }
+        }
+        if (source is MqttTelemetrySource) {
+            presenceCollectorJob = repositoryScope.launch {
+                source.trackerOnline.collect { online ->
+                    _trackerOnline.value = online
+                }
+            }
+        } else {
+            _trackerOnline.value = null
         }
     }
 

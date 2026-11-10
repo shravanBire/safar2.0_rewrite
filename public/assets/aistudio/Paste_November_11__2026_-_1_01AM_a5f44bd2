@@ -1,0 +1,845 @@
+// =====================================================================================
+//  SAFAR 2.0 — ESP32 tracker firmware  (Wi-Fi first; SIM/PPPoS can be added later)
+//  Architecture: edge storage on ESP32 + relay-only MQTT broker (EMQX).  Payloads are
+//  end-to-end encrypted (ChaCha20-Poly1305, key = QR shared secret).
+//
+//  Core 1 (Arduino loop): GPS, MPU6050, trip state machine, RAM->flash logger, crash SOS
+//  Core 0 (net task)    : Wi-Fi, NTP, MQTT/TLS, live + status publish, commands, history sync
+//
+//  Files in this sketch folder:  safar_esp32.ino | safar_crypto.h | safar_types.h | secrets.h
+//  Libraries: PubSubClient, TinyGPSPlus, MPU6050_light  (WiFi, LittleFS, Preferences = ESP32 core)
+// =====================================================================================
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <PubSubClient.h>
+#include <LittleFS.h>
+#include <Preferences.h>
+#include <TinyGPSPlus.h>
+#include <Wire.h>
+#include <MPU6050_light.h>
+#include <math.h>
+#include <time.h>
+#include <esp_system.h>
+#if __has_include(<esp_random.h>)
+#include <esp_random.h>
+#endif
+#include "secrets.h"
+#include "safar_crypto.h"
+#include "safar_types.h"
+
+// =================== FEATURE FLAGS ===================
+#define DEMO_FAKE_GPS       0   // 1 = fake moving GPS point for desk testing (NEVER written to flash)
+#define STREAM_ON_BOOT      0   // 1 = start live streaming at boot without waiting for the app
+#define VERIFY_TLS          0   // 1 = verify broker certificate with EMQX_CA_PEM (needs NTP time). 0 = insecure (quick test only)
+#define ALLOW_REMOTE_CLEAR  1   // 1 = app (Developer Options) may erase trip log; 0 = ignore that command
+
+// =================== PINS ===================
+#define PIN_BUZZER    25
+#define PIN_SOS_BTN   14
+#define GPS_RX_PIN    16
+#define GPS_TX_PIN    17
+
+// =================== PROTOCOL / TIMING ===================
+#define OP_OPEN_SESSION   0x01
+#define OP_LIVE           0x02   // also used for the retained status frame
+#define OP_HISTORY_CHUNK  0x03
+#define OP_HISTORY_ACK    0x04
+#define OP_HEARTBEAT      0x05
+#define OP_CLEAR_FLASH    0x06
+
+static const char*    TRIPS_FILE         = "/trips.bin";
+static const uint32_t LIVE_PERIOD_MS     = 1000;
+static const uint32_t WATCH_TIMEOUT_MS   = 30000;   // app heartbeat is every 20 s
+static const uint32_t STATUS_RIDING_MS   = 60000;   // retained "last known" while riding & app closed
+static const uint32_t STATUS_PARKED_MS   = 300000;  // ... while parked
+static const float    RIDE_START_KMH     = 5.0f;
+static const float    RIDE_STOP_KMH      = 2.0f;
+static const uint32_t RIDE_END_PARK_MS   = 300000;  // stopped this long => trip ends
+static const uint16_t LOG_BUF_POINTS     = 256;     // 256 * 16 B = 4 KB RAM ring (ADR-03)
+static const uint32_t FLASH_MIN_FREE     = 16384;
+
+// =================== GLOBALS ===================
+WiFiClientSecure secureClient;
+PubSubClient     mqtt(secureClient);
+TinyGPSPlus      gps;
+HardwareSerial   gpsSerial(1);
+MPU6050          mpu(Wire);
+Preferences      prefs;
+
+static char    topicStatus[64], topicLive[64], topicCmd[64], topicHist[64], topicPresence[64];
+static uint8_t keyBytes[32];
+static bool    cryptoOk = false;
+
+// shared between the two cores
+static portMUX_TYPE snapMux = portMUX_INITIALIZER_UNLOCKED;
+static Snapshot snap = {};
+static SemaphoreHandle_t fsMutex = NULL;
+static volatile bool requestStatusNow = false;
+static volatile bool clearLogBufRequest = false;
+
+// ---------- logger (core 1) ----------
+static TripPoint logBuf[LOG_BUF_POINTS];
+static uint16_t  logCount = 0;
+static bool      flashFull = false;
+
+// ---------- trip state machine (core 1) ----------
+enum RideState { PARKED, RIDING };
+static RideState rideState = PARKED;
+static uint8_t   moveCount = 0;
+static uint32_t  stoppedSinceMs = 0;
+static uint32_t  tripStartMs = 0;
+static bool      firstPointOfTrip = false;
+static uint32_t  lastPointEpoch = 0;
+static uint8_t   lastHeadingDiv2 = 0;
+
+// ---------- network (core 0) ----------
+static bool     isAppWatching = (STREAM_ON_BOOT != 0);
+static uint32_t lastHeartbeatMs = 0;
+static uint32_t lastLiveMs = 0, lastStatusMs = 0, lastLiveTs = 0;
+static uint16_t seqLive = 0, seqStatus = 0;
+static uint16_t cmdSeq = 0;
+static bool     cmdSeqValid = false;
+static bool     ntpStarted = false;
+static uint32_t lastWifiTryMs = 0, lastMqttTryMs = 0;
+static volatile bool     pendingOpen = false;
+static volatile uint32_t pendingLastTs = 0;
+
+// history sync state
+struct SyncState {
+  bool     active;
+  uint32_t lastTs;          // app already has everything <= lastTs
+  uint32_t cursor;          // byte offset in trips.bin where the next chunk starts
+  uint32_t nextCursor;      // offset after the chunk currently in flight
+  uint16_t chunkId, total;
+  uint8_t  retries;
+  bool     waitingAck;
+  uint32_t sentMs;
+};
+static SyncState syncSt = {};
+static uint32_t  syncedOffset = 0;      // persisted in NVS: bytes of trips.bin already ACKed by the app
+
+// ---------- clock ----------
+static uint32_t clockBaseEpoch = 0, clockBaseMs = 0;
+
+// ---------- crash SOS (core 1) ----------
+enum CrashState { CR_IDLE, CR_TILT_WATCH, CR_ALERT };
+static CrashState crashState = CR_IDLE;
+static uint32_t crashImpactMs = 0, tiltStartMs = 0, alertStartMs = 0, lastBuzzToggleMs = 0;
+static bool     buzzOn = false;
+static float    gref[3] = {0, 0, 1};
+static bool     mpuOk = false;
+static uint32_t lastMpuMs = 0;
+
+// =================== SMALL HELPERS ===================
+static inline void putLE16(uint8_t* p, uint16_t v) { p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); }
+static inline uint16_t getLE16(const uint8_t* p) { return (uint16_t)p[0] | ((uint16_t)p[1] << 8); }
+static inline uint32_t getLE32(const uint8_t* p) { return sc_load32le(p); }
+
+static bool hexToBytes32(const char* hex, uint8_t* out) {
+  if (strlen(hex) != 64) return false;
+  for (int i = 0; i < 32; i++) {
+    char b[3] = { hex[2 * i], hex[2 * i + 1], 0 };
+    char* end = NULL;
+    long v = strtol(b, &end, 16);
+    if (end == b || *end != 0) return false;
+    out[i] = (uint8_t)v;
+  }
+  return true;
+}
+
+static void randomNonce(uint8_t* nonce) { esp_fill_random(nonce, 12); }   // hardware RNG, never repeats in practice
+
+static bool fsLock(uint32_t ms) { return xSemaphoreTake(fsMutex, pdMS_TO_TICKS(ms)) == pdTRUE; }
+static void fsUnlock() { xSemaphoreGive(fsMutex); }
+
+// days since 1970-01-01 for a civil date (no timezone, no mktime)
+static int64_t daysFromCivil(int y, unsigned m, unsigned d) {
+  y -= (m <= 2);
+  const int era = (y >= 0 ? y : y - 399) / 400;
+  const unsigned yoe = (unsigned)(y - era * 400);
+  const unsigned doy = (153 * (m > 2 ? m - 3 : m + 9) + 2) / 5 + d - 1;
+  const unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+  return (int64_t)era * 146097 + (int64_t)doe - 719468;
+}
+
+static uint32_t epochFromGps() {
+  if (!gps.date.isValid() || !gps.time.isValid()) return 0;
+  if (gps.date.age() > 3000 || gps.time.age() > 3000) return 0;
+  int y = gps.date.year();
+  if (y < 2024) return 0;
+  int64_t days = daysFromCivil(y, gps.date.month(), gps.date.day());
+  int64_t sec = days * 86400 + (int64_t)gps.time.hour() * 3600 + gps.time.minute() * 60 + gps.time.second();
+  sec += gps.time.age() / 1000;
+  return (uint32_t)sec;
+}
+
+// real UTC epoch, or 0 when no trustworthy time source exists yet (GPS time -> NTP -> running clock)
+static uint32_t currentEpoch() {
+  uint32_t g = epochFromGps();
+  if (g) { clockBaseEpoch = g; clockBaseMs = millis(); return g; }
+  time_t t = time(nullptr);
+  if (t > 1700000000) { clockBaseEpoch = (uint32_t)t; clockBaseMs = millis(); return (uint32_t)t; }
+  if (clockBaseEpoch) return clockBaseEpoch + (millis() - clockBaseMs) / 1000;
+  return 0;
+}
+
+// =================== CRYPTO SELF-TEST (runs at every boot) ===================
+static bool cryptoSelfTest() {
+  static const char* GOLD_KEY = "a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90";
+  static const char* GOLD_FRAME =
+    "020102030405060708090a0b0c7f8526de0c01105a20d1482764a3388e4e9b906748c2a4a077c4f1f7425bd5df32a9";
+  uint8_t key[32], nonce[12], inner[18], out[47];
+  if (!hexToBytes32(GOLD_KEY, key)) return false;
+  for (int i = 0; i < 12; i++) nonce[i] = (uint8_t)(i + 1);
+  for (int i = 0; i < 18; i++) inner[i] = (uint8_t)((i * 7 + 3) & 0xFF);
+  int n = safar_aead_seal(0x02, key, nonce, inner, 18, out);
+  if (n != 47) return false;
+  char hex[100];
+  for (int i = 0; i < n; i++) snprintf(hex + 2 * i, 3, "%02x", out[i]);
+  bool sealOk = (strcmp(hex, GOLD_FRAME) == 0);
+  uint8_t back[32], op = 0;
+  int r = safar_aead_open(out, n, key, back, sizeof(back), &op);
+  bool openOk = (r == 18 && memcmp(back, inner, 18) == 0 && op == 0x02);
+  out[20] ^= 0x01;
+  bool tamperOk = (safar_aead_open(out, n, key, back, sizeof(back), &op) == -1);
+  Serial.printf("[CRYPTO] self-test seal=%s open=%s tamper-reject=%s\n",
+                sealOk ? "PASS" : "FAIL", openOk ? "PASS" : "FAIL", tamperOk ? "PASS" : "FAIL");
+  return sealOk && openOk && tamperOk;
+}
+
+// =================== LOGGER (core 1) ===================
+static void flushLog() {
+  if (logCount == 0) return;
+  if (!fsLock(500)) return;                       // keep the RAM buffer, try again later
+  size_t freeBytes = LittleFS.totalBytes() - LittleFS.usedBytes();
+  size_t need = (size_t)logCount * sizeof(TripPoint);
+  if (freeBytes < need + FLASH_MIN_FREE) {
+    if (!flashFull) Serial.println("[LOG] Flash almost full - new points are dropped until the app syncs");
+    flashFull = true;
+    logCount = 0;
+    fsUnlock();
+    return;
+  }
+  flashFull = false;
+  File f = LittleFS.open(TRIPS_FILE, FILE_APPEND);
+  bool ok = false;
+  if (f) {
+    ok = (f.write((const uint8_t*)logBuf, need) == need);
+    f.close();
+  }
+  fsUnlock();
+  if (ok) {
+    Serial.printf("[LOG] flushed %u points to flash\n", (unsigned)logCount);
+    logCount = 0;
+  } else {
+    Serial.println("[LOG] flash write failed, will retry");
+  }
+}
+
+static uint32_t logDropped = 0;
+
+static void logPoint(const TripPoint& p) {
+#if !DEMO_FAKE_GPS
+  if (clearLogBufRequest) { logCount = 0; clearLogBufRequest = false; }
+  if (logCount >= LOG_BUF_POINTS) {                 // buffer still full (flash busy/full): try once, else drop this point
+    flushLog();
+    if (logCount >= LOG_BUF_POINTS) { logDropped++; return; }
+  }
+  logBuf[logCount++] = p;
+  if (logCount >= LOG_BUF_POINTS) flushLog();
+#else
+  (void)p;
+#endif
+}
+
+// =================== SENSOR TICK: build point, trip state machine (core 1) ===================
+static void publishSnapshot(const TripPoint& pt, bool valid) {
+  portENTER_CRITICAL(&snapMux);
+  if (valid) { snap.pt = pt; snap.valid = true; snap.updatedMs = millis(); }
+  snap.riding = (rideState == RIDING);
+  portEXIT_CRITICAL(&snapMux);
+}
+
+static void sensorTick() {
+  uint32_t epoch = currentEpoch();
+  bool fixOk = false;
+  float kmh = 0;
+  int32_t latE7 = 0, lonE7 = 0;
+  uint8_t sats = 0;
+
+#if DEMO_FAKE_GPS
+  {
+    static float ang = 0;
+    ang += 0.05f;
+    latE7 = (int32_t)((21.1458 + 0.002 * sin(ang)) * 10000000.0);
+    lonE7 = (int32_t)((79.0882 + 0.002 * cos(ang)) * 10000000.0);
+    kmh = 38.0f + 12.0f * sinf(ang * 2.0f);
+    sats = 9;
+    lastHeadingDiv2 = (uint8_t)(((int)(fmodf(ang * 57.29578f + 90.0f, 360.0f))) / 2);
+    fixOk = (epoch != 0);
+  }
+#else
+  fixOk = gps.location.isValid() && gps.location.age() < 3000 && (epoch != 0);
+  if (fixOk) {
+    latE7 = (int32_t)llround(gps.location.lat() * 10000000.0);
+    lonE7 = (int32_t)llround(gps.location.lng() * 10000000.0);
+    kmh = gps.speed.isValid() ? (float)gps.speed.kmph() : 0.0f;
+    if (kmh < 1.5f) kmh = 0.0f;                       // GPS jitter at standstill
+    if (kmh > 400.0f) kmh = 400.0f;
+    if (gps.course.isValid() && kmh > 3.0f) {
+      int h = (int)gps.course.deg();
+      if (h < 0) h = 0;
+      if (h > 359) h = 359;
+      lastHeadingDiv2 = (uint8_t)(h / 2);
+    }
+    sats = gps.satellites.isValid() ? (uint8_t)(gps.satellites.value() & 0x1F) : 0;
+  }
+#endif
+
+  if (!fixOk) {                                        // never invent data: no fix => no point, no log
+    publishSnapshot(snap.pt, false);
+    return;
+  }
+
+  if (epoch <= lastPointEpoch) epoch = lastPointEpoch + 1;   // strictly increasing timestamps
+  lastPointEpoch = epoch;
+
+  TripPoint pt;
+  pt.timestamp = epoch;
+  pt.latE7 = latE7;
+  pt.lonE7 = lonE7;
+  pt.speedDeciKmh = (uint16_t)(kmh * 10.0f);
+  pt.headingDiv2 = lastHeadingDiv2;
+
+  uint32_t nowMs = millis();
+  uint8_t eventFlags = 0;
+
+  if (rideState == PARKED) {
+    if (kmh >= RIDE_START_KMH) moveCount++; else moveCount = 0;
+    if (moveCount >= 3) {                              // ~3 s of movement => new trip
+      rideState = RIDING;
+      tripStartMs = nowMs;
+      stoppedSinceMs = 0;
+      firstPointOfTrip = true;
+      moveCount = 0;
+      Serial.println("[TRIP] ride started");
+    }
+  } else {                                             // RIDING
+    if (kmh < RIDE_STOP_KMH) {
+      if (stoppedSinceMs == 0) stoppedSinceMs = nowMs;
+    } else {
+      stoppedSinceMs = 0;
+    }
+  }
+
+  bool endNow = (rideState == RIDING && stoppedSinceMs != 0 && (nowMs - stoppedSinceMs) >= RIDE_END_PARK_MS);
+
+  if (rideState == RIDING) {
+    if (firstPointOfTrip) { eventFlags |= FLAG_START; firstPointOfTrip = false; }
+    if (endNow) eventFlags |= FLAG_END;
+  }
+
+  uint8_t baseFlags = (uint8_t)((sats & 0x1F) << 3) | (rideState == RIDING ? FLAG_RIDING : 0);
+  TripPoint logged = pt;
+  logged.flags = baseFlags | eventFlags;
+
+  if (rideState == RIDING) logPoint(logged);
+
+  TripPoint live = pt;                                 // live frame also carries START for the first 3 s (UI resets trip stats)
+  live.flags = baseFlags | eventFlags;
+  if (rideState == RIDING && (nowMs - tripStartMs) < 3000) live.flags |= FLAG_START;
+
+  if (endNow) {
+    flushLog();
+    rideState = PARKED;
+    stoppedSinceMs = 0;
+    requestStatusNow = true;
+    Serial.println("[TRIP] ride ended, log flushed");
+  }
+
+  publishSnapshot(live, true);
+}
+
+// =================== CRASH SOS (non-blocking, core 1) ===================
+static void triggerGsmSos() {
+  // TODO (when the A7670C SIM module arrives): ATD<emergency number>; then AT+CMGS SMS with a Google Maps link.
+  Serial.println("[SOS STUB] SOS FIRED - would place GSM call + send SMS now");
+}
+
+static void calibrateGravityRef() {
+  float sx = 0, sy = 0, sz = 0;
+  int n = 0;
+  for (int i = 0; i < 100; i++) {
+    mpu.update();
+    sx += mpu.getAccX(); sy += mpu.getAccY(); sz += mpu.getAccZ();
+    n++;
+    delay(5);
+  }
+  float m = sqrtf(sx * sx + sy * sy + sz * sz);
+  if (n > 0 && m > 0.2f) { gref[0] = sx / m; gref[1] = sy / m; gref[2] = sz / m; }
+  Serial.printf("[MPU] upright reference captured (%.2f %.2f %.2f) - keep the bike upright at power-on\n", gref[0], gref[1], gref[2]);
+}
+
+static void crashTick() {
+  if (!mpuOk) return;
+  uint32_t now = millis();
+  if (now - lastMpuMs >= 10) {                         // 100 Hz
+    lastMpuMs = now;
+    mpu.update();
+  } else if (crashState != CR_ALERT) {
+    return;
+  }
+
+  float ax = mpu.getAccX(), ay = mpu.getAccY(), az = mpu.getAccZ();
+  float mag = sqrtf(ax * ax + ay * ay + az * az);
+  float tilt = 0;
+  if (mag > 0.3f) {
+    float dot = (ax * gref[0] + ay * gref[1] + az * gref[2]) / mag;
+    if (dot > 1.0f) dot = 1.0f;
+    if (dot < -1.0f) dot = -1.0f;
+    tilt = acosf(dot) * 57.29578f;
+  }
+
+  switch (crashState) {
+    case CR_IDLE:
+      if (mag > 3.5f) {                                // impact
+        crashImpactMs = now;
+        tiltStartMs = 0;
+        crashState = CR_TILT_WATCH;
+        Serial.printf("[CRASH] impact %.1f g - watching tilt\n", mag);
+      }
+      break;
+
+    case CR_TILT_WATCH:
+      if (tilt > 60.0f) {
+        if (tiltStartMs == 0) tiltStartMs = now;
+        if (now - tiltStartMs >= 10000) {              // tilted > 60 deg for 10 s
+          crashState = CR_ALERT;
+          alertStartMs = now;
+          lastBuzzToggleMs = now;
+          buzzOn = true;
+          digitalWrite(PIN_BUZZER, HIGH);
+          Serial.println("[CRASH] CONFIRMED - 15 s cancel window, press the SOS button to cancel");
+        }
+      } else {
+        tiltStartMs = 0;                               // bike came upright again
+      }
+      if (now - crashImpactMs > 40000 && crashState == CR_TILT_WATCH) {
+        crashState = CR_IDLE;                          // false alarm (pothole etc.)
+        Serial.println("[CRASH] no sustained tilt - false alarm cleared");
+      }
+      break;
+
+    case CR_ALERT:
+      if (now - lastBuzzToggleMs >= 200) {
+        lastBuzzToggleMs = now;
+        buzzOn = !buzzOn;
+        digitalWrite(PIN_BUZZER, buzzOn ? HIGH : LOW);
+      }
+      if (digitalRead(PIN_SOS_BTN) == LOW) {
+        delay(30);
+        if (digitalRead(PIN_SOS_BTN) == LOW) {
+          digitalWrite(PIN_BUZZER, LOW);
+          crashState = CR_IDLE;
+          Serial.println("[CRASH] SOS cancelled by rider");
+          break;
+        }
+      }
+      if (now - alertStartMs >= 15000) {
+        digitalWrite(PIN_BUZZER, LOW);
+        crashState = CR_IDLE;
+        triggerGsmSos();
+      }
+      break;
+  }
+}
+
+// =================== NETWORK: publish helpers (core 0) ===================
+static bool publishPoint(const char* topic, uint16_t& seq, const TripPoint& pt, bool retained) {
+  uint8_t inner[18], nonce[12], frame[SAFAR_FRAME_OVERHEAD + 18];
+  putLE16(inner, seq);
+  memcpy(inner + 2, &pt, sizeof(TripPoint));
+  randomNonce(nonce);
+  int n = safar_aead_seal(OP_LIVE, keyBytes, nonce, inner, 18, frame);
+  if (n <= 0) return false;
+  bool ok = mqtt.publish(topic, frame, (unsigned int)n, retained);
+  if (ok) seq++;
+  return ok;
+}
+
+static bool takeSnapshot(Snapshot& out) {
+  portENTER_CRITICAL(&snapMux);
+  out = snap;
+  portEXIT_CRITICAL(&snapMux);
+  return out.valid;
+}
+
+// =================== NETWORK: history sync (core 0) ===================
+static void saveSyncedOffset(uint32_t off) {
+  syncedOffset = off;
+  prefs.putUInt("off", off);
+}
+
+// remove trips.bin when everything in it was ACKed
+static void cleanupFileIfFullySynced() {
+  if (!fsLock(500)) return;
+  if (LittleFS.exists(TRIPS_FILE)) {
+    File f = LittleFS.open(TRIPS_FILE, FILE_READ);
+    size_t sz = f ? f.size() : 0;
+    if (f) f.close();
+    if (syncedOffset >= sz) {
+      LittleFS.remove(TRIPS_FILE);
+      saveSyncedOffset(0);
+      Serial.println("[SYNC] all data ACKed - trip log erased from tracker");
+    }
+  } else if (syncedOffset != 0) {
+    saveSyncedOffset(0);
+  }
+  fsUnlock();
+}
+
+// a stored record is only valid if its time is a real date (>= Oct 2025); junk/old test data is skipped and later erased
+static inline bool isPlausible(const TripPoint& r) { return r.timestamp >= 1760000000UL; }
+
+// count records after `cursor` newer than lastTs; also returns file size
+static bool scanFile(uint32_t cursor, uint32_t lastTs, uint32_t& newCount, uint32_t& fileSize) {
+  newCount = 0; fileSize = 0;
+  if (!fsLock(1000)) return false;
+  if (!LittleFS.exists(TRIPS_FILE)) { fsUnlock(); return true; }
+  File f = LittleFS.open(TRIPS_FILE, FILE_READ);
+  if (!f) { fsUnlock(); return false; }
+  fileSize = f.size();
+  if (cursor > fileSize) cursor = 0;
+  f.seek(cursor);
+  TripPoint rec;
+  while (f.read((uint8_t*)&rec, sizeof(rec)) == sizeof(rec)) {
+    if (isPlausible(rec) && rec.timestamp > lastTs) newCount++;
+  }
+  f.close();
+  fsUnlock();
+  return true;
+}
+
+static void startSync(uint32_t lastTs) {
+  syncSt = {};
+  uint32_t newCount = 0, fileSize = 0;
+  uint32_t cur = syncedOffset - (syncedOffset % sizeof(TripPoint));
+  if (!scanFile(cur, lastTs, newCount, fileSize)) return;
+  if (cur > fileSize) { cur = 0; saveSyncedOffset(0); }
+  if (newCount == 0) {                                 // app already has everything in the file
+    if (fileSize > cur) { saveSyncedOffset(fileSize - (fileSize % sizeof(TripPoint))); }
+    cleanupFileIfFullySynced();
+    Serial.println("[SYNC] nothing new for the app");
+    return;
+  }
+  syncSt.active = true;
+  syncSt.lastTs = lastTs;
+  syncSt.cursor = cur;
+  syncSt.chunkId = 0;
+  syncSt.total = (uint16_t)((newCount + 29) / 30);
+  Serial.printf("[SYNC] %u new points, %u chunks\n", (unsigned)newCount, (unsigned)syncSt.total);
+}
+
+static bool sendCurrentChunk() {
+  uint8_t inner[5 + 480];
+  memset(inner, 0, sizeof(inner));
+  uint8_t count = 0;
+  uint32_t next = syncSt.cursor;
+  if (!fsLock(1000)) return false;
+  File f = LittleFS.open(TRIPS_FILE, FILE_READ);
+  if (!f) { fsUnlock(); return false; }
+  f.seek(syncSt.cursor);
+  TripPoint rec;
+  while (count < 30 && f.read((uint8_t*)&rec, sizeof(rec)) == sizeof(rec)) {
+    next += sizeof(rec);
+    if (isPlausible(rec) && rec.timestamp > syncSt.lastTs) {
+      memcpy(inner + 5 + count * sizeof(TripPoint), &rec, sizeof(rec));
+      count++;
+    }
+  }
+  f.close();
+  fsUnlock();
+  if (count == 0) { syncSt.active = false; return false; }
+
+  putLE16(inner + 0, syncSt.chunkId);
+  putLE16(inner + 2, syncSt.total);
+  inner[4] = count;
+
+  uint8_t nonce[12], frame[SAFAR_FRAME_OVERHEAD + 485];
+  randomNonce(nonce);
+  int n = safar_aead_seal(OP_HISTORY_CHUNK, keyBytes, nonce, inner, 485, frame);
+  if (n <= 0) return false;
+  if (!mqtt.publish(topicHist, frame, (unsigned int)n, false)) return false;
+  syncSt.nextCursor = next;
+  syncSt.waitingAck = true;
+  syncSt.sentMs = millis();
+  return true;
+}
+
+static void syncTick() {
+  if (!syncSt.active || !mqtt.connected()) return;
+  if (!syncSt.waitingAck) {
+    if (syncSt.chunkId >= syncSt.total) {              // finished
+      syncSt.active = false;
+      cleanupFileIfFullySynced();
+      Serial.println("[SYNC] complete");
+      return;
+    }
+    if (!sendCurrentChunk()) {
+      if (++syncSt.retries > 3) { syncSt.active = false; Serial.println("[SYNC] aborted (send failed)"); }
+    }
+    return;
+  }
+  if (millis() - syncSt.sentMs > 3000) {               // no ACK: resend (stop-and-wait)
+    syncSt.waitingAck = false;
+    if (++syncSt.retries > 3) {
+      syncSt.active = false;
+      Serial.println("[SYNC] aborted (no ACK) - will retry on next app session");
+    }
+  }
+}
+
+// =================== NETWORK: incoming commands (core 0) ===================
+static void onMqttMessage(char* topic, byte* payload, unsigned int length) {
+  (void)topic;
+  uint8_t inner[32], op = 0;
+  int n = safar_aead_open((const uint8_t*)payload, length, keyBytes, inner, sizeof(inner), &op);
+  if (n < 0) return;                                   // not authentic => ignore silently
+
+  uint32_t epoch = currentEpoch();
+  switch (op) {
+    case OP_OPEN_SESSION:                              // lastSyncedTs(4) + seq(2)
+      if (n != 6) return;
+      cmdSeq = getLE16(inner + 4);
+      cmdSeqValid = true;
+      isAppWatching = true;
+      lastHeartbeatMs = millis();
+      pendingLastTs = getLE32(inner);
+      pendingOpen = true;                              // handled in the net loop (never publish inside the callback)
+      Serial.println("[APP] session opened");
+      break;
+
+    case OP_HEARTBEAT: {                               // ts(4) + seq(2)
+      if (n != 6) return;
+      uint32_t ts = getLE32(inner);
+      uint16_t seq = getLE16(inner + 4);
+      if (epoch != 0) {
+        int64_t diff = (int64_t)ts - (int64_t)epoch;
+        if (diff > 600 || diff < -600) return;         // stale / replayed heartbeat
+      }
+      if (cmdSeqValid && (int16_t)(seq - cmdSeq) <= 0) return;
+      cmdSeq = seq; cmdSeqValid = true;
+      isAppWatching = true;
+      lastHeartbeatMs = millis();
+      break;
+    }
+
+    case OP_HISTORY_ACK: {                             // chunkId(2) + status(1) + reserved(1)
+      if (n != 4) return;
+      uint16_t id = getLE16(inner);
+      uint8_t status = inner[2];
+      if (syncSt.active && syncSt.waitingAck && id == syncSt.chunkId) {
+        if (status == 0) {
+          saveSyncedOffset(syncSt.nextCursor);
+          syncSt.cursor = syncSt.nextCursor;
+          syncSt.chunkId++;
+          syncSt.retries = 0;
+          syncSt.waitingAck = false;
+        } else {
+          syncSt.waitingAck = false;                   // app could not store it: resend
+          if (++syncSt.retries > 3) syncSt.active = false;
+        }
+      }
+      break;
+    }
+
+    case OP_CLEAR_FLASH: {                             // upToTs(4) + mode(1) + seq(2)   (developer tool)
+#if ALLOW_REMOTE_CLEAR
+      if (n != 7) return;
+      uint32_t ts = getLE32(inner);
+      uint16_t seq = getLE16(inner + 5);
+      if (epoch == 0) return;
+      int64_t diff = (int64_t)ts - (int64_t)epoch;
+      if (diff > 120 || diff < -120) return;           // must be a fresh command
+      if (cmdSeqValid && (int16_t)(seq - cmdSeq) <= 0) return;
+      cmdSeq = seq; cmdSeqValid = true;
+      if (fsLock(1000)) {
+        LittleFS.remove(TRIPS_FILE);
+        saveSyncedOffset(0);
+        fsUnlock();
+      }
+      clearLogBufRequest = true;
+      syncSt = {};
+      Serial.println("[FLASH] trip log erased by app command");
+#endif
+      break;
+    }
+    default: break;
+  }
+}
+
+// =================== NETWORK: connection management + loop (core 0) ===================
+static void ensureWifiAndTime() {
+  if (WiFi.status() != WL_CONNECTED) {
+    ntpStarted = false;
+    if (millis() - lastWifiTryMs > 15000 || lastWifiTryMs == 0) {
+      lastWifiTryMs = millis();
+      Serial.println("[WIFI] connecting...");
+      WiFi.disconnect();
+      WiFi.begin(WIFI_SSID, WIFI_PASS);
+    }
+    return;
+  }
+  if (!ntpStarted) {
+    configTime(0, 0, "pool.ntp.org", "time.google.com");   // UTC epoch; no timezone needed
+    ntpStarted = true;
+    Serial.println("[WIFI] connected, NTP started");
+  }
+}
+
+static bool tryMqttConnect() {
+#if VERIFY_TLS
+  if (time(nullptr) < 1700000000) return false;        // certificate validation needs real time
+#endif
+  char clientId[32];
+  snprintf(clientId, sizeof(clientId), "safar_%08x", (unsigned)esp_random());
+  Serial.print("[MQTT] connecting...");
+  if (!mqtt.connect(clientId, MQTT_USER, MQTT_PASS, topicPresence, 1, true, "0")) {
+    Serial.printf(" failed, state=%d\n", mqtt.state());
+    return false;
+  }
+  Serial.println(" connected");
+  mqtt.subscribe(topicCmd, 1);
+  mqtt.publish(topicPresence, (const uint8_t*)"1", 1, true);
+  cmdSeqValid = false;
+  syncSt = {};
+  lastLiveMs = 0;
+  lastStatusMs = 0;
+  lastHeartbeatMs = millis();
+  return true;
+}
+
+static void netTask(void*) {
+  for (;;) {
+    ensureWifiAndTime();
+
+    if (WiFi.status() == WL_CONNECTED && cryptoOk) {
+      if (!mqtt.connected()) {
+        if (millis() - lastMqttTryMs > 5000 || lastMqttTryMs == 0) {
+          lastMqttTryMs = millis();
+          tryMqttConnect();
+        }
+      } else {
+        mqtt.loop();
+        uint32_t now = millis();
+
+        if (pendingOpen) { pendingOpen = false; startSync(pendingLastTs); }
+
+        if (isAppWatching && (now - lastHeartbeatMs > WATCH_TIMEOUT_MS)) {
+          isAppWatching = false;
+          requestStatusNow = true;
+          Serial.println("[APP] heartbeat timeout - live streaming stopped");
+        }
+
+        Snapshot s;
+        bool have = takeSnapshot(s);
+
+        if (isAppWatching && have && (now - lastLiveMs >= LIVE_PERIOD_MS)) {
+          lastLiveMs = now;
+          if ((now - s.updatedMs) < 3500 && s.pt.timestamp != lastLiveTs) {
+            if (publishPoint(topicLive, seqLive, s.pt, false)) lastLiveTs = s.pt.timestamp;
+          }
+        }
+
+        if (have && !isAppWatching) {
+          uint32_t period = s.riding ? STATUS_RIDING_MS : STATUS_PARKED_MS;
+          if (requestStatusNow || lastStatusMs == 0 || (now - lastStatusMs) >= period) {
+            requestStatusNow = false;
+            lastStatusMs = now;
+            publishPoint(topicStatus, seqStatus, s.pt, true);     // retained: instant "last seen" for the app
+          }
+        } else if (isAppWatching) {
+          requestStatusNow = false;
+        }
+
+        syncTick();
+      }
+    }
+    vTaskDelay(pdMS_TO_TICKS(5));
+  }
+}
+
+// =================== SETUP / LOOP ===================
+void setup() {
+  Serial.begin(115200);
+  delay(300);
+  Serial.println("\n=== SAFAR 2.0 tracker booting ===");
+
+  pinMode(PIN_BUZZER, OUTPUT);
+  digitalWrite(PIN_BUZZER, LOW);
+  pinMode(PIN_SOS_BTN, INPUT_PULLUP);
+
+  fsMutex = xSemaphoreCreateMutex();
+
+  snprintf(topicStatus,   sizeof(topicStatus),   "safar/v1/%s/status",   DEV_ID);
+  snprintf(topicLive,     sizeof(topicLive),     "safar/v1/%s/live",     DEV_ID);
+  snprintf(topicCmd,      sizeof(topicCmd),      "safar/v1/%s/cmd",      DEV_ID);
+  snprintf(topicHist,     sizeof(topicHist),     "safar/v1/%s/hist",     DEV_ID);
+  snprintf(topicPresence, sizeof(topicPresence), "safar/v1/%s/presence", DEV_ID);
+
+  bool keyOk = hexToBytes32(SHARED_SECRET_HEX, keyBytes);
+  if (!keyOk) Serial.println("[CONFIG] SHARED_SECRET_HEX must be exactly 64 hex characters!");
+  bool selfOk = cryptoSelfTest();
+  cryptoOk = keyOk && selfOk;
+  if (!cryptoOk) Serial.println("[CRYPTO] NOT OK - network disabled until fixed");
+
+  if (!LittleFS.begin(true)) Serial.println("[FS] LittleFS mount failed");
+  prefs.begin("safar", false);
+  syncedOffset = prefs.getUInt("off", 0);
+  if (prefs.getUInt("fmt", 0) != 2) {                  // first boot of this firmware: erase the old test log (fake data/timestamps)
+    LittleFS.remove(TRIPS_FILE);
+    prefs.putUInt("off", 0);
+    syncedOffset = 0;
+    prefs.putUInt("fmt", 2);
+    Serial.println("[FS] old test log erased (one-time migration)");
+  }
+
+  Wire.begin();                                        // SDA=21, SCL=22
+  byte st = mpu.begin(1, 2);                           // gyro 500 dps, accel +-8 g (needed to see > 3.5 g impacts)
+  mpuOk = (st == 0);
+  if (mpuOk) calibrateGravityRef(); else Serial.println("[MPU] init failed - crash detection disabled");
+
+  gpsSerial.setRxBufferSize(1024);
+  gpsSerial.begin(9600, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
+
+  WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(true);
+#if VERIFY_TLS
+  if (strstr(EMQX_CA_PEM, "PASTE_YOUR") != NULL) Serial.println("[TLS] ERROR: paste the EMQX CA certificate into secrets.h (or set VERIFY_TLS 0 for a quick test)");
+  secureClient.setCACert(EMQX_CA_PEM);
+#else
+  secureClient.setInsecure();
+  Serial.println("[TLS] WARNING: certificate verification is OFF");
+#endif
+  mqtt.setServer(MQTT_BROKER, MQTT_PORT);
+  mqtt.setCallback(onMqttMessage);
+  mqtt.setBufferSize(640);
+  mqtt.setKeepAlive(30);
+
+  xTaskCreatePinnedToCore(netTask, "net", 16384, NULL, 1, NULL, 0);   // network on core 0; loop() stays on core 1
+  Serial.printf("[BOOT] topics: safar/v1/%s/{status,live,hist,cmd,presence}\n", DEV_ID);
+}
+
+void loop() {
+  while (gpsSerial.available() > 0) gps.encode((char)gpsSerial.read());
+
+  static uint32_t lastTickMs = 0;
+  uint32_t now = millis();
+  if (now - lastTickMs >= 1000) {
+    lastTickMs = now;
+    sensorTick();
+  }
+
+  crashTick();
+  delay(2);
+}

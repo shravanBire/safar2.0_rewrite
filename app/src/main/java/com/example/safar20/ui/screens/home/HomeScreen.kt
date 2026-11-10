@@ -24,7 +24,6 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Compress
 import androidx.compose.material.icons.filled.Expand
-import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.QrCodeScanner
 import androidx.compose.material.icons.filled.Router
 import androidx.compose.material.icons.filled.Stop
@@ -93,17 +92,19 @@ fun HomeScreen(
     var qrErrorMessage by remember { mutableStateOf<String?>(null) }
     var isMapExpanded by remember { mutableStateOf(false) }
 
-    val currentLat = liveTelemetry?.latitude ?: selectedDevice?.lastLat ?: 21.1458
-    val currentLon = liveTelemetry?.longitude ?: selectedDevice?.lastLon ?: 79.0882
+    val realOrSavedLat = liveTelemetry?.latitude ?: selectedDevice?.lastLat
+    val realOrSavedLon = liveTelemetry?.longitude ?: selectedDevice?.lastLon
     val currentSpeed = if (hasLiveData && connectionState is ConnectionState.LIVE) liveTelemetry?.speedKmh ?: 0.0f else 0.0f
     val currentHeading = liveTelemetry?.heading ?: 210
 
-    var mapCenterLat by remember { mutableDoubleStateOf(currentLat) }
-    var mapCenterLon by remember { mutableDoubleStateOf(currentLon) }
+    var mapCenterLat by remember { mutableDoubleStateOf(realOrSavedLat ?: 21.1458) }
+    var mapCenterLon by remember { mutableDoubleStateOf(realOrSavedLon ?: 79.0882) }
 
-    LaunchedEffect(currentLat, currentLon) {
-        mapCenterLat = currentLat
-        mapCenterLon = currentLon
+    LaunchedEffect(realOrSavedLat, realOrSavedLon) {
+        if (realOrSavedLat != null && realOrSavedLon != null) {
+            mapCenterLat = realOrSavedLat
+            mapCenterLon = realOrSavedLon
+        }
     }
 
     val mapHeight by animateDpAsState(
@@ -275,7 +276,7 @@ fun HomeScreen(
 
             Spacer(modifier = Modifier.height(20.dp))
 
-            // Section Label + Quick Simulator Toggle Pill Row
+            // Section Label (+ Stop Simulator Pill ONLY if Dev Simulator was started from Developer Options)
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -285,38 +286,39 @@ fun HomeScreen(
             ) {
                 SectionLabel("NAVIGATION CLUSTER")
 
-                // Quick Simulator Toggle Pill Button
-                Box(
-                    modifier = Modifier
-                        .clip(RoundedCornerShape(12.dp))
-                        .background(if (isSimulatorRunning) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.surface)
-                        .border(1.dp, MaterialTheme.colorScheme.outline, RoundedCornerShape(12.dp))
-                        .clickable { viewModel.toggleSimulator(!isSimulatorRunning) }
-                        .padding(horizontal = 10.dp, vertical = 4.dp)
-                ) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Icon(
-                            imageVector = if (isSimulatorRunning) Icons.Default.Stop else Icons.Default.PlayArrow,
-                            contentDescription = null,
-                            tint = if (isSimulatorRunning) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.primary,
-                            modifier = Modifier.size(12.dp)
-                        )
-                        Spacer(modifier = Modifier.width(4.dp))
-                        Text(
-                            text = if (isSimulatorRunning) "STOP SIM" else "MOCK SIM",
-                            color = if (isSimulatorRunning) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.primary,
-                            fontFamily = Rajdhani,
-                            fontWeight = FontWeight.Bold,
-                            fontSize = 10.sp,
-                            letterSpacing = 1.sp
-                        )
+                if (isSimulatorRunning) {
+                    Box(
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(12.dp))
+                            .background(MaterialTheme.colorScheme.primary)
+                            .border(1.dp, MaterialTheme.colorScheme.outline, RoundedCornerShape(12.dp))
+                            .clickable { viewModel.toggleSimulator(false) }
+                            .padding(horizontal = 10.dp, vertical = 4.dp)
+                    ) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Icon(
+                                imageVector = Icons.Default.Stop,
+                                contentDescription = null,
+                                tint = MaterialTheme.colorScheme.onPrimary,
+                                modifier = Modifier.size(12.dp)
+                            )
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Text(
+                                text = "STOP DEV SIM",
+                                color = MaterialTheme.colorScheme.onPrimary,
+                                fontFamily = Rajdhani,
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 10.sp,
+                                letterSpacing = 1.sp
+                            )
+                        }
                     }
                 }
             }
 
             Spacer(modifier = Modifier.height(6.dp))
 
-            // 4. Map inset with expandable height and LIVE indicator
+            // 4. Map inset with expandable height and LIVE / PARKED indicator
             Box(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -364,7 +366,10 @@ fun HomeScreen(
                     }
                 }
 
-                if (connectionState is ConnectionState.LIVE) {
+                if (connectionState is ConnectionState.LIVE || connectionState is ConnectionState.PARKED) {
+                    val isLiveBadge = connectionState is ConnectionState.LIVE
+                    val badgeColor = if (isLiveBadge) PhosphorGreen else RoyalBrass
+                    val badgeLabel = if (isLiveBadge) "LIVE" else "PARKED"
                     Row(
                         modifier = Modifier
                             .align(Alignment.TopStart)
@@ -377,12 +382,12 @@ fun HomeScreen(
                         Box(
                             modifier = Modifier
                                 .size(6.dp)
-                                .background(PhosphorGreen, shape = CircleShape)
+                                .background(badgeColor, shape = CircleShape)
                         )
                         Spacer(modifier = Modifier.width(4.dp))
                         Text(
-                            text = "LIVE",
-                            color = PhosphorGreen,
+                            text = badgeLabel,
+                            color = badgeColor,
                             fontFamily = Rajdhani,
                             fontWeight = FontWeight.Bold,
                             fontSize = 10.sp,
