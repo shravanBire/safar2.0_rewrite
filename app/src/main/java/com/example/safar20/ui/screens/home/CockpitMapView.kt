@@ -14,6 +14,7 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Map
@@ -24,6 +25,7 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableDoubleStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -41,7 +43,9 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import com.example.safar20.data.local.entity.LocationPointEntity
+import com.example.safar20.ui.theme.PhosphorGreen
 import com.example.safar20.ui.theme.Rajdhani
+import com.example.safar20.ui.theme.RoyalBrass
 import org.maplibre.android.MapLibre
 import org.maplibre.android.annotations.Marker
 import org.maplibre.android.annotations.MarkerOptions
@@ -53,6 +57,8 @@ import org.maplibre.android.geometry.LatLngBounds
 import org.maplibre.android.maps.MapLibreMap
 import org.maplibre.android.maps.MapView
 import org.maplibre.android.maps.Style
+import java.util.Locale
+import kotlin.math.abs
 
 /**
  * MapLibre Native MapView for Cockpit & Trips preview.
@@ -66,8 +72,10 @@ fun CockpitMapView(
     latitude: Double,
     longitude: Double,
     heading: Int = 0,
+    satCount: Int? = null,
     trackerName: String = "Tracker Position",
     routePoints: List<LocationPointEntity> = emptyList(),
+    liveTrailPoints: List<LocationPointEntity> = emptyList(),
     modifier: Modifier = Modifier.fillMaxSize()
 ) {
     val context = LocalContext.current
@@ -88,23 +96,24 @@ fun CockpitMapView(
     }
     val lifecycleOwner = LocalLifecycleOwner.current
 
-    val latestLat by androidx.compose.runtime.rememberUpdatedState(latitude)
-    val latestLon by androidx.compose.runtime.rememberUpdatedState(longitude)
-    val latestTrackerName by androidx.compose.runtime.rememberUpdatedState(trackerName)
-    val latestRoutePoints by androidx.compose.runtime.rememberUpdatedState(routePoints)
-
     var currentMarker by remember { mutableStateOf<Marker?>(null) }
     var currentPolyline by remember { mutableStateOf<Polyline?>(null) }
     var startMarker by remember { mutableStateOf<Marker?>(null) }
     var endMarker by remember { mutableStateOf<Marker?>(null) }
+    var lastCameraLat by remember { mutableDoubleStateOf(0.0) }
+    var lastCameraLon by remember { mutableDoubleStateOf(0.0) }
 
-    val syncMapAnnotations: (MapLibreMap) -> Unit = { map ->
-        val pts = latestRoutePoints
-        val lat = latestLat
-        val lon = latestLon
-        val tName = latestTrackerName
-
+    fun applyMapAnnotations(
+        map: MapLibreMap,
+        lat: Double,
+        lon: Double,
+        tName: String,
+        pts: List<LocationPointEntity>,
+        trailPts: List<LocationPointEntity>,
+        follow: Boolean
+    ) {
         if (pts.isNotEmpty()) {
+            // Historical Trip Route Mode (TripsScreen)
             currentMarker?.let { map.removeAnnotation(it) }
             currentMarker = null
 
@@ -142,29 +151,52 @@ fun CockpitMapView(
                 }
             }
         } else if (lat != 0.0 && lon != 0.0) {
-            currentPolyline?.let { map.removeAnnotation(it) }
+            // Live / Parked Cockpit Mode (HomeScreen)
             startMarker?.let { map.removeAnnotation(it) }
             endMarker?.let { map.removeAnnotation(it) }
-            currentPolyline = null
             startMarker = null
             endMarker = null
 
             val currentPos = LatLng(lat, lon)
 
-            val marker = currentMarker
-            if (marker != null) {
-                marker.position = currentPos
-                marker.title = tName
-            } else {
-                currentMarker = map.addMarker(
-                    MarkerOptions()
-                        .position(currentPos)
-                        .title(tName)
-                )
+            // Always remove & re-add marker so MapLibre GL Native reliably renders at new coordinates
+            currentMarker?.let { map.removeAnnotation(it) }
+            currentMarker = map.addMarker(
+                MarkerOptions()
+                    .position(currentPos)
+                    .title(tName)
+            )
+
+            // Draw live breadcrumb trail if available
+            currentPolyline?.let { map.removeAnnotation(it) }
+            currentPolyline = null
+            if (trailPts.size >= 2) {
+                val trailLatLngs = trailPts.map { LatLng(it.latitude, it.longitude) } + currentPos
+                val polylineOptions = PolylineOptions()
+                    .addAll(trailLatLngs)
+                    .color(Color.parseColor("#D4AF37"))
+                    .width(5f)
+                currentPolyline = map.addPolyline(polylineOptions)
             }
 
-            if (isFollowingBike) {
-                map.animateCamera(CameraUpdateFactory.newLatLngZoom(currentPos, 15.0))
+            if (follow) {
+                val dLat = abs(lat - lastCameraLat)
+                val dLon = abs(lon - lastCameraLon)
+                val isFirstOrLargeJump = (lastCameraLat == 0.0 && lastCameraLon == 0.0) || (dLat > 0.005 || dLon > 0.005)
+                val isMoved = dLat > 0.00001 || dLon > 0.00001
+
+                if (isFirstOrLargeJump) {
+                    lastCameraLat = lat
+                    lastCameraLon = lon
+                    // Instant camera move on initial lock / large jump so tiles load immediately
+                    map.moveCamera(CameraUpdateFactory.newLatLngZoom(currentPos, 15.5))
+                } else if (isMoved) {
+                    lastCameraLat = lat
+                    lastCameraLon = lon
+                    // Short 350ms ease so 1s updates don't cancel tile loading
+                    val targetZoom = if (map.cameraPosition.zoom < 12.0) 15.5 else map.cameraPosition.zoom
+                    map.easeCamera(CameraUpdateFactory.newLatLngZoom(currentPos, targetZoom), 350)
+                }
             }
         }
     }
@@ -223,7 +255,15 @@ fun CockpitMapView(
                                 map.uiSettings.isAttributionEnabled = false
                                 map.uiSettings.isLogoEnabled = false
 
-                                syncMapAnnotations(map)
+                                applyMapAnnotations(
+                                    map = map,
+                                    lat = latitude,
+                                    lon = longitude,
+                                    tName = trackerName,
+                                    pts = routePoints,
+                                    trailPts = liveTrailPoints,
+                                    follow = isFollowingBike
+                                )
                             }
                             mapView.addOnDidFailLoadingMapListener {
                                 isMapError = true
@@ -232,9 +272,42 @@ fun CockpitMapView(
                     }
                 },
                 update = { view ->
+                    // Read Compose state synchronously inside update so every coordinate change triggers update
+                    val targetLat = latitude
+                    val targetLon = longitude
+                    val targetName = trackerName
+                    val targetRoutes = routePoints
+                    val targetTrail = liveTrailPoints
+                    val followMode = isFollowingBike
+
                     view.getMapAsync { map ->
-                        map.getStyle {
-                            syncMapAnnotations(map)
+                        if (map.style != null && map.style!!.isFullyLoaded) {
+                            applyMapAnnotations(
+                                map = map,
+                                lat = targetLat,
+                                lon = targetLon,
+                                tName = targetName,
+                                pts = targetRoutes,
+                                trailPts = targetTrail,
+                                follow = followMode
+                            )
+                        } else {
+                            // Even if style tiles are still streaming over mobile hotspot, move camera & marker
+                            if (targetRoutes.isEmpty() && targetLat != 0.0 && targetLon != 0.0 && followMode) {
+                                val pos = LatLng(targetLat, targetLon)
+                                map.moveCamera(CameraUpdateFactory.newLatLngZoom(pos, 15.5))
+                            }
+                            map.getStyle {
+                                applyMapAnnotations(
+                                    map = map,
+                                    lat = targetLat,
+                                    lon = targetLon,
+                                    tName = targetName,
+                                    pts = targetRoutes,
+                                    trailPts = targetTrail,
+                                    follow = followMode
+                                )
+                            }
                         }
                     }
                 },
@@ -252,6 +325,24 @@ fun CockpitMapView(
                         false
                     }
             )
+        }
+
+        // Center Live Tracker Beacon (Always visible when FOLLOWING is active, even while tiles load over cellular)
+        if (routePoints.isEmpty() && isFollowingBike && latitude != 0.0 && longitude != 0.0) {
+            Box(
+                modifier = Modifier
+                    .align(Alignment.Center)
+                    .size(22.dp)
+                    .background(RoyalBrass.copy(alpha = 0.28f), shape = CircleShape)
+                    .border(1.5.dp, RoyalBrass, shape = CircleShape),
+                contentAlignment = Alignment.Center
+            ) {
+                Box(
+                    modifier = Modifier
+                        .size(8.dp)
+                        .background(PhosphorGreen, shape = CircleShape)
+                )
+            }
         }
 
         // Overlay if Map fails to load tiles
@@ -282,6 +373,32 @@ fun CockpitMapView(
             }
         }
 
+        // Bottom-Start Live Coordinates & Satellites Pill
+        if (routePoints.isEmpty() && latitude != 0.0 && longitude != 0.0) {
+            val coordText = remember(latitude, longitude, satCount) {
+                val base = String.format(Locale.US, "%.5f, %.5f", latitude, longitude)
+                if (satCount != null && satCount > 0) "$base • $satCount SATS" else base
+            }
+            Box(
+                modifier = Modifier
+                    .align(Alignment.BottomStart)
+                    .padding(12.dp)
+                    .clip(RoundedCornerShape(10.dp))
+                    .background(MaterialTheme.colorScheme.background.copy(alpha = 0.85f))
+                    .border(1.dp, MaterialTheme.colorScheme.outline, RoundedCornerShape(10.dp))
+                    .padding(horizontal = 8.dp, vertical = 4.dp)
+            ) {
+                Text(
+                    text = coordText,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    fontFamily = Rajdhani,
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 10.sp,
+                    letterSpacing = 0.5.sp
+                )
+            }
+        }
+
         // Floating Recenter / Follow Bike Button
         if (routePoints.isEmpty() && !isMapError && mapView != null) {
             Box(
@@ -298,8 +415,10 @@ fun CockpitMapView(
                     .clickable {
                         isFollowingBike = true
                         if (latitude != 0.0 && longitude != 0.0) {
+                            lastCameraLat = latitude
+                            lastCameraLon = longitude
                             mapView.getMapAsync { map ->
-                                map.animateCamera(CameraUpdateFactory.newLatLngZoom(LatLng(latitude, longitude), 15.0))
+                                map.moveCamera(CameraUpdateFactory.newLatLngZoom(LatLng(latitude, longitude), 15.5))
                             }
                         }
                     }
@@ -327,3 +446,4 @@ fun CockpitMapView(
         }
     }
 }
+

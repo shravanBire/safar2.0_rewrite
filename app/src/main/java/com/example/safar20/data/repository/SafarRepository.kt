@@ -192,6 +192,13 @@ class SafarRepository(
         } else false
     }
 
+    fun requestHistorySync(): Boolean {
+        val source = activeTelemetrySource
+        return if (source is MqttTelemetrySource) {
+            source.requestHistorySync()
+        } else false
+    }
+
     suspend fun seedDemoTrips(deviceId: String) {
         val now = System.currentTimeMillis() / 1000
         val oneDaySec = 86400L

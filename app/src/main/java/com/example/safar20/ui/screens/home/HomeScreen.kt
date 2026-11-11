@@ -79,6 +79,7 @@ fun HomeScreen(
     val allDevices by viewModel.allDevices.collectAsState()
     val hasLiveData by viewModel.hasLiveData.collectAsState()
     val liveTelemetry by viewModel.liveTelemetry.collectAsState()
+    val liveTrailPoints by viewModel.liveTrailPoints.collectAsState()
     val liveOdoKm by viewModel.liveOdoDistanceKm.collectAsState()
     val liveTripDist by viewModel.liveTripDistanceKm.collectAsState()
     val liveAvgSpeed by viewModel.liveAvgSpeedKmh.collectAsState()
@@ -332,6 +333,9 @@ fun HomeScreen(
                     latitude = mapCenterLat,
                     longitude = mapCenterLon,
                     heading = currentHeading,
+                    satCount = liveTelemetry?.satCount,
+                    trackerName = selectedDevice?.deviceName ?: "Tracker Position",
+                    liveTrailPoints = liveTrailPoints,
                     modifier = Modifier.fillMaxSize()
                 )
 

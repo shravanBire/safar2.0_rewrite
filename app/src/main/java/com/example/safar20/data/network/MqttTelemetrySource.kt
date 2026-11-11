@@ -198,6 +198,22 @@ class MqttTelemetrySource(
         return publishCommand(packet)
     }
 
+    fun requestHistorySync(): Boolean {
+        if (!isConnected) return false
+        scope.launch {
+            try {
+                val freshLastSynced = lastSyncedProvider?.invoke() ?: 0L
+                val openSessionPacket = BinaryPacketCodec.encodeOpenSession(
+                    lastSyncedTimestamp = freshLastSynced,
+                    sequenceNumber = sequenceNumber++
+                )
+                publishCommand(openSessionPacket)
+            } catch (_: Exception) {
+            }
+        }
+        return true
+    }
+
     fun publishCommand(commandPacket: ByteArray): Boolean {
         val client = mqttClient ?: return false
         if (!client.isConnected) return false

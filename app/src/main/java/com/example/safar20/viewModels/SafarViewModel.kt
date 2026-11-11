@@ -100,6 +100,9 @@ class SafarViewModel(
     private val _liveTelemetry = MutableStateFlow<BinaryPacketCodec.ParsedTripPoint?>(null)
     val liveTelemetry: StateFlow<BinaryPacketCodec.ParsedTripPoint?> = _liveTelemetry.asStateFlow()
 
+    private val _liveTrailPoints = MutableStateFlow<List<LocationPointEntity>>(emptyList())
+    val liveTrailPoints: StateFlow<List<LocationPointEntity>> = _liveTrailPoints.asStateFlow()
+
     private val _liveOdoDistanceKm = MutableStateFlow(0.0)
     val liveOdoDistanceKm: StateFlow<Double> = _liveOdoDistanceKm.asStateFlow()
 
@@ -207,6 +210,7 @@ class SafarViewModel(
 
                 if (telemetryPoint.isTripStart) {
                     _liveTripDistanceKm.value = 0.0
+                    _liveTrailPoints.value = emptyList()
                     previousPoint = null
                 }
 
@@ -231,6 +235,27 @@ class SafarViewModel(
                 previousPoint = telemetryPoint
                 _liveTelemetry.value = telemetryPoint
 
+                val newTrailPt = LocationPointEntity(
+                    tripId = "LIVE",
+                    deviceId = selectedDevice.value?.deviceId ?: "SAFAR",
+                    timestamp = telemetryPoint.timestamp,
+                    latitude = telemetryPoint.latitude,
+                    longitude = telemetryPoint.longitude,
+                    speedKmh = telemetryPoint.speedKmh,
+                    heading = telemetryPoint.heading
+                )
+                val updatedTrail = _liveTrailPoints.value
+                if (updatedTrail.isEmpty() ||
+                    calculateDistanceMeters(
+                        updatedTrail.last().latitude,
+                        updatedTrail.last().longitude,
+                        newTrailPt.latitude,
+                        newTrailPt.longitude
+                    ) >= 2.0
+                ) {
+                    _liveTrailPoints.value = (updatedTrail + newTrailPt).takeLast(500)
+                }
+
                 // Persist real tracker coordinates only (never persist Mock Simulator points)
                 if (!_isSimulatorRunning.value) {
                     val nowSec = System.currentTimeMillis() / 1000
@@ -245,6 +270,12 @@ class SafarViewModel(
                                 speed = telemetryPoint.speedKmh,
                                 timestamp = effectiveTs
                             )
+                        }
+                    }
+                    if (telemetryPoint.isTripEnd) {
+                        viewModelScope.launch {
+                            delay(1500)
+                            repository.requestHistorySync()
                         }
                     }
                 }
@@ -427,11 +458,16 @@ class SafarViewModel(
         return repository.sendClearFlashCommand(mode)
     }
 
+    fun requestHistorySync(): Boolean {
+        return repository.requestHistorySync()
+    }
+
     // --- UI Actions ---
     fun selectDevice(deviceId: String) {
         viewModelScope.launch {
             if (selectedDevice.value?.deviceId != deviceId) {
                 _liveTelemetry.value = null
+                _liveTrailPoints.value = emptyList()
                 _hasLiveData.value = false
                 lastLivePacketElapsedRealtime = 0L
                 lastLocationDbWriteTime = 0L
@@ -490,6 +526,7 @@ class SafarViewModel(
         if (enable) {
             _hasLiveData.value = true
             _liveTripDistanceKm.value = 0.0
+            _liveTrailPoints.value = emptyList()
             _liveAvgSpeedKmh.value = 0.0
             _liveMaxSpeedKmh.value = 0.0
             liveSpeedSum = 0.0
@@ -500,6 +537,7 @@ class SafarViewModel(
         } else {
             repository.stopSimulator()
             _liveTelemetry.value = null
+            _liveTrailPoints.value = emptyList()
             lastLivePacketElapsedRealtime = 0L
             previousPoint = null
             _hasLiveData.value = (selectedDevice.value?.lastLat != null && selectedDevice.value?.lastLon != null)

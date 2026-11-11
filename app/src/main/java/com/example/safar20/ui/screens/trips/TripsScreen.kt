@@ -96,6 +96,13 @@ fun TripsScreen(
         tripHistory.any { it.tripId.startsWith("DEMO_") }
     }
 
+    // Auto-request history sync from tracker when Logbook screen opens
+    LaunchedEffect(selectedDevice?.deviceId) {
+        if (selectedDevice != null) {
+            viewModel.requestHistorySync()
+        }
+    }
+
     // Auto-select first trip on load
     LaunchedEffect(tripHistory) {
         if (selectedTripId == null && tripHistory.isNotEmpty()) {
@@ -134,7 +141,7 @@ fun TripsScreen(
             .fillMaxSize()
             .background(MaterialTheme.colorScheme.background)
     ) {
-        // 1. Screen Header: SectionLabel + DEMO DATA Badge + Bebas Date Title
+        // 1. Screen Header: SectionLabel + SYNC LOGS button + DEMO DATA Badge + Bebas Date Title
         Column(
             modifier = Modifier
                 .fillMaxWidth()
@@ -146,21 +153,54 @@ fun TripsScreen(
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 SectionLabel("LOGBOOK")
-                if (isDemoData) {
-                    Box(
-                        modifier = Modifier
-                            .background(RoyalBrass.copy(alpha = 0.2f), shape = RoundedCornerShape(8.dp))
-                            .border(1.dp, RoyalBrass, shape = RoundedCornerShape(8.dp))
-                            .padding(horizontal = 8.dp, vertical = 2.dp)
-                    ) {
-                        Text(
-                            text = "DEMO DATA",
-                            color = RoyalBrass,
-                            fontFamily = Rajdhani,
-                            fontWeight = FontWeight.Bold,
-                            fontSize = 10.sp,
-                            letterSpacing = 1.sp
-                        )
+                Row(
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    if (isDemoData) {
+                        Box(
+                            modifier = Modifier
+                                .background(RoyalBrass.copy(alpha = 0.2f), shape = RoundedCornerShape(8.dp))
+                                .border(1.dp, RoyalBrass, shape = RoundedCornerShape(8.dp))
+                                .padding(horizontal = 8.dp, vertical = 2.dp)
+                        ) {
+                            Text(
+                                text = "DEMO DATA",
+                                color = RoyalBrass,
+                                fontFamily = Rajdhani,
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 10.sp,
+                                letterSpacing = 1.sp
+                            )
+                        }
+                    }
+                    if (selectedDevice != null) {
+                        Box(
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(8.dp))
+                                .background(MaterialTheme.colorScheme.surface)
+                                .border(1.dp, MaterialTheme.colorScheme.primary, RoundedCornerShape(8.dp))
+                                .clickable { viewModel.requestHistorySync() }
+                                .padding(horizontal = 10.dp, vertical = 4.dp)
+                        ) {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Icon(
+                                    imageVector = Icons.Default.CloudDownload,
+                                    contentDescription = "Sync Logs",
+                                    tint = MaterialTheme.colorScheme.primary,
+                                    modifier = Modifier.size(13.dp)
+                                )
+                                Spacer(modifier = Modifier.width(4.dp))
+                                Text(
+                                    text = if (historySyncProgress != null) "SYNCING ${historySyncProgress}%" else "SYNC LOGS",
+                                    color = MaterialTheme.colorScheme.primary,
+                                    fontFamily = Rajdhani,
+                                    fontWeight = FontWeight.Bold,
+                                    fontSize = 10.sp,
+                                    letterSpacing = 1.sp
+                                )
+                            }
+                        }
                     }
                 }
             }
