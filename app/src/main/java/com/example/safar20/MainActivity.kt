@@ -27,8 +27,11 @@ import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.NavigationBarItemDefaults
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.SnackbarHost
+import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
@@ -48,6 +51,7 @@ import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.ProcessLifecycleOwner
 import androidx.lifecycle.ViewModelProvider
 import com.example.safar20.data.local.AppLog
+import com.example.safar20.ui.components.FirstRunOnboardingDialog
 import com.example.safar20.ui.components.IgnitionSplash
 import com.example.safar20.ui.screens.home.HomeScreen
 import com.example.safar20.ui.screens.settings.SettingScreen
@@ -147,14 +151,31 @@ sealed class NavItem(val route: String, val title: String, val icon: ImageVector
 @Composable
 fun SafarAppContent(safarViewModel: SafarViewModel) {
     val isDarkTheme by safarViewModel.isDarkTheme.collectAsState()
+    val hasCompletedOnboarding by safarViewModel.hasCompletedOnboarding.collectAsState()
+    val allDevices by safarViewModel.allDevices.collectAsState()
+    val transientMessage by safarViewModel.transientMessage.collectAsState()
+
     var selectedScreenIndex by remember { mutableIntStateOf(0) }
     var showSplash by rememberSaveable { mutableStateOf(true) }
+    var openPairingOnHome by remember { mutableStateOf(false) }
+    var openAdvancedInSettings by remember { mutableStateOf(false) }
+
+    val snackbarHostState = remember { SnackbarHostState() }
+
+    LaunchedEffect(transientMessage) {
+        val msg = transientMessage
+        if (!msg.isNullOrBlank()) {
+            snackbarHostState.showSnackbar(msg)
+            safarViewModel.clearTransientMessage()
+        }
+    }
 
     val navItems = listOf(NavItem.Cockpit, NavItem.Logbook, NavItem.Settings)
 
     SafarTheme(darkTheme = isDarkTheme) {
         Box(modifier = Modifier.fillMaxSize()) {
             Scaffold(
+                snackbarHost = { SnackbarHost(hostState = snackbarHostState) },
                 bottomBar = {
                     Column(modifier = Modifier.fillMaxWidth()) {
                         Box(
@@ -218,15 +239,36 @@ fun SafarAppContent(safarViewModel: SafarViewModel) {
             ) { innerPadding ->
                 Box(modifier = Modifier.padding(innerPadding)) {
                     when (selectedScreenIndex) {
-                        0 -> HomeScreen(viewModel = safarViewModel)
+                        0 -> HomeScreen(
+                            viewModel = safarViewModel,
+                            launchPairingAutomatically = openPairingOnHome,
+                            onPairingLaunched = { openPairingOnHome = false },
+                            onOpenAdvancedSettings = {
+                                openAdvancedInSettings = true
+                                selectedScreenIndex = 2
+                            }
+                        )
                         1 -> TripsScreen(viewModel = safarViewModel)
-                        2 -> SettingScreen(viewModel = safarViewModel)
+                        2 -> SettingScreen(
+                            viewModel = safarViewModel,
+                            initialExpandAdvanced = openAdvancedInSettings,
+                            onAdvancedExpandedHandled = { openAdvancedInSettings = false }
+                        )
                     }
                 }
             }
 
             if (showSplash) {
                 IgnitionSplash(onFinished = { showSplash = false })
+            } else if (!hasCompletedOnboarding && allDevices.isEmpty()) {
+                FirstRunOnboardingDialog(
+                    onSkipOrFinish = { safarViewModel.completeOnboarding() },
+                    onStartPairing = {
+                        safarViewModel.completeOnboarding()
+                        selectedScreenIndex = 0
+                        openPairingOnHome = true
+                    }
+                )
             }
         }
     }

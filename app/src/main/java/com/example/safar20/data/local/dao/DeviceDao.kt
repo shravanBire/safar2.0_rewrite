@@ -58,6 +58,9 @@ interface DeviceDao {
     @Query("UPDATE devices SET last_synced_timestamp = :timestamp WHERE device_id = :deviceId")
     suspend fun updateLastSyncedTimestamp(deviceId: String, timestamp: Long)
 
+    @Query("UPDATE devices SET device_name = :newName WHERE device_id = :deviceId")
+    suspend fun renameDevice(deviceId: String, newName: String)
+
     @Delete
     suspend fun deleteDevice(device: DeviceEntity)
 

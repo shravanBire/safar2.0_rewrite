@@ -6,6 +6,9 @@ import com.example.safar20.data.network.BinaryPacketCodec
 import com.example.safar20.data.network.BinaryPacketCodec.ParsedTripPoint
 import com.example.safar20.data.network.CryptoEngine
 import com.example.safar20.data.network.MqttTelemetrySource
+import com.example.safar20.data.repository.SafarRepository
+import com.example.safar20.ui.components.ConnectionState
+import com.example.safar20.ui.components.StateMessageCatalog
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
@@ -194,5 +197,69 @@ class Phase4UnitTest {
         }
         assertEquals(expected, received)
     }
+
+    @Test
+    fun testQrV2AndV1Parser() {
+        val pub = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        val sec = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
+
+        // 1. QR v2 with embedded broker
+        val qrV2 = "safar://pair?v=2&id=SAFAR_01&name=Classic350&pub=$pub&sec=$sec&sim=%2B919876543210&broker=ssl%3A%2F%2Fbroker.emqx.io%3A8883&bu=rider1&bp=secretPass"
+        val resV2 = SafarRepository.parseQrUriData(qrV2)
+        assertTrue("QR v2 must parse successfully", resV2.isSuccess)
+        val dataV2 = resV2.getOrThrow()
+        assertEquals(2, dataV2.version)
+        assertEquals("SAFAR_01", dataV2.deviceId)
+        assertEquals("Classic350", dataV2.deviceName)
+        assertEquals("+919876543210", dataV2.simNumber)
+        assertEquals("ssl://broker.emqx.io:8883", dataV2.brokerUri)
+        assertEquals("rider1", dataV2.brokerUsername)
+        assertEquals("secretPass", dataV2.brokerPassword)
+
+        // 2. QR v1 without broker preserves null brokerUri (fallback to Settings)
+        val qrV1 = "safar://pair?id=SAFAR_01&name=Classic350&pub=$pub&sec=$sec&sim=+919876543210"
+        val resV1 = SafarRepository.parseQrUriData(qrV1)
+        assertTrue("QR v1 must parse successfully", resV1.isSuccess)
+        val dataV1 = resV1.getOrThrow()
+        assertEquals(1, dataV1.version)
+        assertNull(dataV1.brokerUri)
+        assertEquals("+919876543210", dataV1.simNumber)
+
+        // 3. Invalid non-ssl broker in QR v2 must be rejected
+        val badBrokerQr = "safar://pair?v=2&id=SAFAR_01&name=Classic350&pub=$pub&sec=$sec&broker=tcp://broker.emqx.io:1883"
+        assertTrue("Non-ssl broker URI must fail", SafarRepository.parseQrUriData(badBrokerQr).isFailure)
+    }
+
+    @Test
+    fun testStateMessageCatalog() {
+        val offlineEntry = StateMessageCatalog.resolve(ConnectionState.LIVE, isNetworkAvailable = false)
+        assertEquals("Waiting for internet", offlineEntry.message)
+
+        val noDeviceEntry = StateMessageCatalog.resolve(ConnectionState.NO_DEVICE)
+        assertEquals("Pair your tracker to start", noDeviceEntry.message)
+        assertEquals("PAIR", noDeviceEntry.primaryActionLabel)
+
+        val brokerMissingEntry = StateMessageCatalog.resolve(ConnectionState.BROKER_NOT_CONFIGURED)
+        assertEquals("Setup incomplete", brokerMissingEntry.message)
+        assertEquals("Open Advanced", brokerMissingEntry.primaryActionLabel)
+
+        val noFixEntry = StateMessageCatalog.resolve(ConnectionState.LIVE_NO_FIX)
+        assertEquals("Tracker is searching for satellites. Move to open sky.", noFixEntry.message)
+
+        val parkedEntry = StateMessageCatalog.resolve(ConnectionState.PARKED(1000L))
+        assertTrue(parkedEntry.message.startsWith("Parked"))
+        assertEquals("Navigate to bike", parkedEntry.primaryActionLabel)
+    }
+
+    @Test
+    fun testExponentialBackoffSchedule() {
+        assertEquals(2_000L, MqttTelemetrySource.computeBackoffDelayMs(0))
+        assertEquals(4_000L, MqttTelemetrySource.computeBackoffDelayMs(1))
+        assertEquals(8_000L, MqttTelemetrySource.computeBackoffDelayMs(2))
+        assertEquals(16_000L, MqttTelemetrySource.computeBackoffDelayMs(3))
+        assertEquals(30_000L, MqttTelemetrySource.computeBackoffDelayMs(4))
+        assertEquals(30_000L, MqttTelemetrySource.computeBackoffDelayMs(10))
+    }
 }
+
 

@@ -14,3 +14,7 @@
 .cxx
 local.properties
 dev-preview.cjs
+**/secrets.h
+devices.csv
+tools/out/
+

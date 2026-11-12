@@ -23,43 +23,57 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.CloudDownload
 import androidx.compose.material.icons.filled.Speed
+import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
+import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.safar20.ui.components.RideTicketCard
 import com.example.safar20.ui.components.SectionLabel
 import com.example.safar20.ui.theme.BebasNeue
+import com.example.safar20.ui.theme.Inter
 import com.example.safar20.ui.theme.PhosphorGreen
 import com.example.safar20.ui.theme.Rajdhani
 import com.example.safar20.ui.theme.RoyalBrass
 import com.example.safar20.viewModels.SafarViewModel
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import java.text.SimpleDateFormat
 import java.util.Calendar
 import java.util.Locale
 
 /**
  * Logbook Screen displaying vintage highway ride tickets, 14-day horizontal date selector,
- * indicator dots for dates with rides, DEMO DATA badge, and route map previews.
+ * pull-to-refresh ("Sync now" via requestHistorySync) with live progress percentage,
+ * and friendly first-ride guidance empty states (P2-U5).
  */
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun TripsScreen(
     viewModel: SafarViewModel,
     modifier: Modifier = Modifier
 ) {
+    val scope = rememberCoroutineScope()
     val selectedDevice by viewModel.selectedDevice.collectAsState()
     val tripHistory by viewModel.tripHistory.collectAsState()
     val selectedTripId by viewModel.selectedTripId.collectAsState()
@@ -67,7 +81,8 @@ fun TripsScreen(
     val speedUnit by viewModel.speedUnit.collectAsState()
     val historySyncProgress by viewModel.historySyncProgress.collectAsState()
 
-    // Generate last 14 days calendar list
+    var isPullRefreshing by remember { mutableStateOf(false) }
+
     val dateList = remember {
         (0..13).map { daysAgo ->
             Calendar.getInstance().apply {
@@ -96,21 +111,18 @@ fun TripsScreen(
         tripHistory.any { it.tripId.startsWith("DEMO_") }
     }
 
-    // Auto-request history sync from tracker when Logbook screen opens
     LaunchedEffect(selectedDevice?.deviceId) {
         if (selectedDevice != null) {
             viewModel.requestHistorySync()
         }
     }
 
-    // Auto-select first trip on load
     LaunchedEffect(tripHistory) {
         if (selectedTripId == null && tripHistory.isNotEmpty()) {
             viewModel.selectTripForMapPreview(tripHistory.first().tripId)
         }
     }
 
-    // Filter trips for selected date
     val filteredTrips = remember(tripHistory, selectedDateIndex) {
         if (selectedDateIndex == 0) {
             tripHistory
@@ -122,7 +134,6 @@ fun TripsScreen(
         }
     }
 
-    // Map of dates having rides
     val datesWithRidesSet = remember(tripHistory) {
         tripHistory.map { trip ->
             val cal = Calendar.getInstance().apply {
@@ -136,12 +147,21 @@ fun TripsScreen(
         }.toSet()
     }
 
+    val triggerManualSync = {
+        val requested = viewModel.requestHistorySync()
+        if (requested) {
+            viewModel.showTransientMessage("Syncing rides from tracker…")
+        } else {
+            viewModel.showTransientMessage("Tracker is offline — will sync automatically when connected")
+        }
+    }
+
     Column(
         modifier = modifier
             .fillMaxSize()
             .background(MaterialTheme.colorScheme.background)
     ) {
-        // 1. Screen Header: SectionLabel + SYNC LOGS button + DEMO DATA Badge + Bebas Date Title
+        // 1. Screen Header: SectionLabel + SYNC NOW button + DEMO DATA Badge + Bebas Date Title
         Column(
             modifier = Modifier
                 .fillMaxWidth()
@@ -180,19 +200,19 @@ fun TripsScreen(
                                 .clip(RoundedCornerShape(8.dp))
                                 .background(MaterialTheme.colorScheme.surface)
                                 .border(1.dp, MaterialTheme.colorScheme.primary, RoundedCornerShape(8.dp))
-                                .clickable { viewModel.requestHistorySync() }
+                                .clickable { triggerManualSync() }
                                 .padding(horizontal = 10.dp, vertical = 4.dp)
                         ) {
                             Row(verticalAlignment = Alignment.CenterVertically) {
                                 Icon(
                                     imageVector = Icons.Default.CloudDownload,
-                                    contentDescription = "Sync Logs",
+                                    contentDescription = "Sync Now",
                                     tint = MaterialTheme.colorScheme.primary,
                                     modifier = Modifier.size(13.dp)
                                 )
                                 Spacer(modifier = Modifier.width(4.dp))
                                 Text(
-                                    text = if (historySyncProgress != null) "SYNCING ${historySyncProgress}%" else "SYNC LOGS",
+                                    text = if (historySyncProgress != null) "SYNCING ${historySyncProgress}%" else "SYNC NOW",
                                     color = MaterialTheme.colorScheme.primary,
                                     fontFamily = Rajdhani,
                                     fontWeight = FontWeight.Bold,
@@ -211,6 +231,16 @@ fun TripsScreen(
                 fontSize = 32.sp,
                 color = MaterialTheme.colorScheme.onSurface
             )
+
+            if (historySyncProgress != null) {
+                Spacer(modifier = Modifier.height(6.dp))
+                LinearProgressIndicator(
+                    progress = { (historySyncProgress ?: 0) / 100f },
+                    modifier = Modifier.fillMaxWidth(),
+                    color = RoyalBrass,
+                    trackColor = MaterialTheme.colorScheme.surface
+                )
+            }
         }
 
         // 2. Horizontal Scrolling Date Chip Strip with Indicator Dots
@@ -276,120 +306,154 @@ fun TripsScreen(
 
         Spacer(modifier = Modifier.height(16.dp))
 
-        // 3. Logbook Ride Tickets or Empty State
-        when {
-            selectedDevice == null -> {
-                Box(
-                    modifier = Modifier
-                        .fillMaxSize()
-                        .padding(32.dp),
-                    contentAlignment = Alignment.Center
-                ) {
-                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                        Icon(
-                            imageVector = Icons.Default.Speed,
-                            contentDescription = null,
-                            tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.4f),
-                            modifier = Modifier.size(56.dp)
-                        )
-                        Spacer(modifier = Modifier.height(12.dp))
-                        Text(
-                            text = "NO TRACKER SELECTED",
-                            fontFamily = Rajdhani,
-                            fontWeight = FontWeight.Bold,
-                            fontSize = 16.sp,
-                            color = MaterialTheme.colorScheme.onSurface,
-                            letterSpacing = 1.sp
-                        )
-                        Spacer(modifier = Modifier.height(4.dp))
-                        Text(
-                            text = "Pair or select a tracker to view stored ride logs",
-                            fontFamily = Rajdhani,
-                            fontSize = 12.sp,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
+        // 3. Pull-to-refresh Logbook Ride Tickets or Empty State Guidance (P2-U5)
+        PullToRefreshBox(
+            isRefreshing = isPullRefreshing || historySyncProgress != null,
+            onRefresh = {
+                scope.launch {
+                    isPullRefreshing = true
+                    triggerManualSync()
+                    delay(800L)
+                    isPullRefreshing = false
+                }
+            },
+            modifier = Modifier.fillMaxSize()
+        ) {
+            when {
+                selectedDevice == null -> {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .padding(32.dp),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                            Icon(
+                                imageVector = Icons.Default.Speed,
+                                contentDescription = null,
+                                tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.4f),
+                                modifier = Modifier.size(56.dp)
+                            )
+                            Spacer(modifier = Modifier.height(12.dp))
+                            Text(
+                                text = "PAIR YOUR TRACKER TO START",
+                                fontFamily = Rajdhani,
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 16.sp,
+                                color = MaterialTheme.colorScheme.onSurface,
+                                letterSpacing = 1.sp
+                            )
+                            Spacer(modifier = Modifier.height(6.dp))
+                            Text(
+                                text = "Once paired, every ride recorded on your motorcycle's flash memory will sync here automatically.",
+                                fontFamily = Inter,
+                                fontSize = 12.sp,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                textAlign = TextAlign.Center
+                            )
+                        }
                     }
                 }
-            }
-            historySyncProgress != null -> {
-                Box(
-                    modifier = Modifier
-                        .fillMaxSize()
-                        .padding(32.dp),
-                    contentAlignment = Alignment.Center
-                ) {
-                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                        Icon(
-                            imageVector = Icons.Default.CloudDownload,
-                            contentDescription = null,
-                            tint = RoyalBrass,
-                            modifier = Modifier.size(48.dp)
-                        )
-                        Spacer(modifier = Modifier.height(12.dp))
-                        Text(
-                            text = "SYNCING RIDE LOGS (${historySyncProgress}%)",
-                            fontFamily = Rajdhani,
-                            fontWeight = FontWeight.Bold,
-                            fontSize = 15.sp,
-                            color = MaterialTheme.colorScheme.onSurface,
-                            letterSpacing = 1.sp
-                        )
-                        Spacer(modifier = Modifier.height(12.dp))
-                        CircularProgressIndicator(
-                            color = RoyalBrass,
-                            modifier = Modifier.size(24.dp),
-                            strokeWidth = 2.dp
-                        )
+                historySyncProgress != null && filteredTrips.isEmpty() -> {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .padding(32.dp),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                            Icon(
+                                imageVector = Icons.Default.CloudDownload,
+                                contentDescription = null,
+                                tint = RoyalBrass,
+                                modifier = Modifier.size(48.dp)
+                            )
+                            Spacer(modifier = Modifier.height(12.dp))
+                            Text(
+                                text = "SYNCING RIDES… ${historySyncProgress}%",
+                                fontFamily = Rajdhani,
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 15.sp,
+                                color = MaterialTheme.colorScheme.onSurface,
+                                letterSpacing = 1.sp
+                            )
+                            Spacer(modifier = Modifier.height(12.dp))
+                            CircularProgressIndicator(
+                                color = RoyalBrass,
+                                modifier = Modifier.size(24.dp),
+                                strokeWidth = 2.dp
+                            )
+                        }
                     }
                 }
-            }
-            filteredTrips.isEmpty() -> {
-                Box(
-                    modifier = Modifier
-                        .fillMaxSize()
-                        .padding(32.dp),
-                    contentAlignment = Alignment.Center
-                ) {
-                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                        Icon(
-                            imageVector = Icons.Default.Speed,
-                            contentDescription = null,
-                            tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.4f),
-                            modifier = Modifier.size(56.dp)
-                        )
-                        Spacer(modifier = Modifier.height(12.dp))
-                        Text(
-                            text = if (selectedDateIndex == 0) "NO RIDES LOGGED YET" else "NO RIDES FOR THIS DATE",
-                            fontFamily = Rajdhani,
-                            fontWeight = FontWeight.Bold,
-                            fontSize = 14.sp,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            letterSpacing = 2.sp
-                        )
-                    }
-                }
-            }
-            else -> {
-                LazyColumn(
-                    modifier = Modifier.fillMaxSize(),
-                    contentPadding = PaddingValues(bottom = 80.dp)
-                ) {
-                    items(
-                        items = filteredTrips,
-                        key = { it.tripId }
-                    ) { trip ->
-                        val isSelected = (trip.tripId == selectedTripId)
-                        RideTicketCard(
-                            trip = trip,
-                            speedUnit = speedUnit,
-                            isSelected = isSelected,
-                            routePoints = if (isSelected) selectedTripPoints else emptyList(),
-                            onCardClick = {
-                                viewModel.selectTripForMapPreview(
-                                    if (isSelected) null else trip.tripId
-                                )
+                filteredTrips.isEmpty() -> {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .padding(32.dp),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                            Icon(
+                                imageVector = Icons.Default.Speed,
+                                contentDescription = null,
+                                tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.4f),
+                                modifier = Modifier.size(56.dp)
+                            )
+                            Spacer(modifier = Modifier.height(12.dp))
+                            Text(
+                                text = if (selectedDateIndex == 0) "YOUR FIRST RIDE AWAITS" else "NO RIDES ON THIS DATE",
+                                fontFamily = Rajdhani,
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 16.sp,
+                                color = MaterialTheme.colorScheme.onSurface,
+                                letterSpacing = 1.5.sp
+                            )
+                            Spacer(modifier = Modifier.height(6.dp))
+                            Text(
+                                text = if (selectedDateIndex == 0)
+                                    "Start your motorcycle and ride. Even if you ride through zero-network zones, SAFAR records your route on the tracker and syncs it here when you finish."
+                                else
+                                    "Select 'ALL' to see all recorded rides or pull down to sync from your tracker.",
+                                fontFamily = Inter,
+                                fontSize = 12.sp,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                textAlign = TextAlign.Center
+                            )
+                            Spacer(modifier = Modifier.height(16.dp))
+                            Button(
+                                onClick = { triggerManualSync() },
+                                colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary)
+                            ) {
+                                Icon(Icons.Default.CloudDownload, contentDescription = null, modifier = Modifier.size(16.dp))
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Text("SYNC NOW", fontFamily = Rajdhani, fontWeight = FontWeight.Bold, fontSize = 12.sp)
                             }
-                        )
+                        }
+                    }
+                }
+                else -> {
+                    LazyColumn(
+                        modifier = Modifier.fillMaxSize(),
+                        contentPadding = PaddingValues(bottom = 80.dp)
+                    ) {
+                        items(
+                            items = filteredTrips,
+                            key = { it.tripId }
+                        ) { trip ->
+                            val isSelected = (trip.tripId == selectedTripId)
+                            RideTicketCard(
+                                trip = trip,
+                                speedUnit = speedUnit,
+                                isSelected = isSelected,
+                                routePoints = if (isSelected) selectedTripPoints else emptyList(),
+                                onCardClick = {
+                                    viewModel.selectTripForMapPreview(
+                                        if (isSelected) null else trip.tripId
+                                    )
+                                }
+                            )
+                        }
                     }
                 }
             }

@@ -74,6 +74,26 @@ class SafarViewModel(
     val isDevModeEnabled: StateFlow<Boolean> = repository.isDevModeEnabled
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), false)
 
+    val hasCompletedOnboarding: StateFlow<Boolean> = repository.hasCompletedOnboarding
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), true)
+
+    private val _transientMessage = MutableStateFlow<String?>(null)
+    val transientMessage: StateFlow<String?> = _transientMessage.asStateFlow()
+
+    fun showTransientMessage(message: String) {
+        _transientMessage.value = message
+    }
+
+    fun clearTransientMessage() {
+        _transientMessage.value = null
+    }
+
+    fun completeOnboarding() {
+        viewModelScope.launch {
+            repository.setHasCompletedOnboarding(true)
+        }
+    }
+
     // --- Foreground and Network State ---
     private val _isForeground = MutableStateFlow(true)
     val isForeground: StateFlow<Boolean> = _isForeground.asStateFlow()
@@ -604,9 +624,24 @@ class SafarViewModel(
         }
     }
 
+    fun retryConnection() {
+        disconnect()
+        connectIfReady()
+    }
+
+    fun renameDevice(deviceId: String, newName: String) {
+        val clean = newName.trim()
+        if (clean.isEmpty()) return
+        viewModelScope.launch {
+            repository.renameDevice(deviceId, clean)
+            showTransientMessage("Tracker renamed to $clean")
+        }
+    }
+
     fun deleteDevice(deviceId: String) {
         viewModelScope.launch {
             repository.deleteDeviceAndHistory(deviceId)
+            showTransientMessage("Tracker deleted")
         }
     }
 

@@ -139,74 +139,95 @@ class MqttTelemetrySource(
         AppLog.i("MQTT", "Connecting to broker for topicId=$topicDevId")
 
         scope.launch {
-            try {
-                closeOldClient()
+            var attempt = 0
+            while (isActive && !isStopped.get() && !isConnected) {
+                try {
+                    closeOldClient()
 
-                val clientId = "SafarApp_" + UUID.randomUUID().toString().take(8)
-                val client = MqttClient(brokerUri.trim(), clientId, MemoryPersistence())
-                mqttClient = client
+                    val clientId = "SafarApp_" + UUID.randomUUID().toString().take(8)
+                    val client = MqttClient(brokerUri.trim(), clientId, MemoryPersistence())
+                    mqttClient = client
 
-                client.setCallback(object : MqttCallbackExtended {
-                    override fun connectComplete(reconnect: Boolean, serverURI: String?) {
-                        isConnected = true
-                        isConnecting.set(false)
-                        _linkState.value = LinkState.Connected
-                        liveReplayValidator.reset()
-                        statusReplayValidator.reset()
-                        lastPacketAcceptedTime = System.currentTimeMillis()
-                        AppLog.i("MQTT", "Connected (reconnect=$reconnect) topicId=$topicDevId")
+                    client.setCallback(object : MqttCallbackExtended {
+                        override fun connectComplete(reconnect: Boolean, serverURI: String?) {
+                            isConnected = true
+                            isConnecting.set(false)
+                            _linkState.value = LinkState.Connected
+                            liveReplayValidator.reset()
+                            statusReplayValidator.reset()
+                            lastPacketAcceptedTime = System.currentTimeMillis()
+                            AppLog.i("MQTT", "Connected (reconnect=$reconnect) topicId=$topicDevId")
 
-                        scope.launch {
-                            try {
-                                client.subscribe(subTopics, subQos)
+                            scope.launch {
+                                try {
+                                    client.subscribe(subTopics, subQos)
 
-                                val freshLastSynced = lastSyncedProvider?.invoke() ?: 0L
-                                val openSessionPacket = BinaryPacketCodec.encodeOpenSession(
-                                    lastSyncedTimestamp = freshLastSynced,
-                                    sequenceNumber = sequenceNumber++
-                                )
-                                publishCommand(openSessionPacket)
-                                startHeartbeatLoop()
-                            } catch (e: Exception) {
-                                AppLog.e("MQTT", "Post-connect subscribe/openSession failed", e)
+                                    val freshLastSynced = lastSyncedProvider?.invoke() ?: 0L
+                                    val openSessionPacket = BinaryPacketCodec.encodeOpenSession(
+                                        lastSyncedTimestamp = freshLastSynced,
+                                        sequenceNumber = sequenceNumber++
+                                    )
+                                    publishCommand(openSessionPacket)
+                                    startHeartbeatLoop()
+                                } catch (e: Exception) {
+                                    AppLog.e("MQTT", "Post-connect subscribe/openSession failed", e)
+                                }
                             }
                         }
-                    }
 
-                    override fun connectionLost(cause: Throwable?) {
-                        isConnected = false
-                        isConnecting.set(true)
-                        stopHeartbeat()
-                        _linkState.value = LinkState.Connecting
-                        AppLog.e("MQTT", "Connection lost; auto-reconnecting", cause)
-                    }
-
-                    override fun messageArrived(topic: String, message: MqttMessage) {
-                        val bytes = message.payload ?: return
-                        if (bytes.isNotEmpty()) {
-                            incomingChannel.trySend(topic to bytes)
+                        override fun connectionLost(cause: Throwable?) {
+                            isConnected = false
+                            isConnecting.set(true)
+                            stopHeartbeat()
+                            _linkState.value = LinkState.Connecting
+                            AppLog.e("MQTT", "Connection lost; auto-reconnecting", cause)
                         }
+
+                        override fun messageArrived(topic: String, message: MqttMessage) {
+                            val bytes = message.payload ?: return
+                            if (bytes.isNotEmpty()) {
+                                incomingChannel.trySend(topic to bytes)
+                            }
+                        }
+
+                        override fun deliveryComplete(token: IMqttDeliveryToken?) {}
+                    })
+
+                    val options = MqttConnectOptions().apply {
+                        isCleanSession = true
+                        isAutomaticReconnect = true
+                        connectionTimeout = 12
+                        keepAliveInterval = 30
+                        if (mqttUsername.isNotBlank()) userName = mqttUsername
+                        if (mqttPassword.isNotBlank()) password = mqttPassword.toCharArray()
                     }
 
-                    override fun deliveryComplete(token: IMqttDeliveryToken?) {}
-                })
+                    client.connect(options)
+                    break
+                } catch (e: Exception) {
+                    isConnected = false
+                    val errorMsg = mapExceptionToHumanMessage(e)
+                    _linkState.value = LinkState.Error(errorMsg)
+                    AppLog.e("MQTT", "Connect attempt ${attempt + 1} failed: $errorMsg", e)
 
-                val options = MqttConnectOptions().apply {
-                    isCleanSession = true
-                    isAutomaticReconnect = true
-                    connectionTimeout = 15
-                    keepAliveInterval = 30
-                    if (mqttUsername.isNotBlank()) userName = mqttUsername
-                    if (mqttPassword.isNotBlank()) password = mqttPassword.toCharArray()
+                    // Do not loop forever on fatal auth / invalid URI errors
+                    if (e is IllegalArgumentException || e is URISyntaxException ||
+                        (e is MqttException && (e.reasonCode == 4 || e.reasonCode == 5))
+                    ) {
+                        isConnecting.set(false)
+                        break
+                    }
+
+                    val backoffMs = computeBackoffDelayMs(attempt)
+                    attempt++
+                    delay(backoffMs)
+                    if (!isStopped.get() && !isConnected) {
+                        _linkState.value = LinkState.Connecting
+                    }
                 }
-
-                client.connect(options)
-            } catch (e: Exception) {
-                isConnected = false
+            }
+            if (isStopped.get() || !isConnected) {
                 isConnecting.set(false)
-                val errorMsg = mapExceptionToHumanMessage(e)
-                _linkState.value = LinkState.Error(errorMsg)
-                AppLog.e("MQTT", "Connect failed: $errorMsg", e)
             }
         }
     }
@@ -370,6 +391,11 @@ class MqttTelemetrySource(
                 }
             }
             return "0000000000000000"
+        }
+
+        fun computeBackoffDelayMs(attempt: Int): Long {
+            val shift = attempt.coerceIn(0, 4)
+            return minOf(30_000L, 2_000L * (1L shl shift))
         }
 
         fun mapExceptionToHumanMessage(e: Exception): String {

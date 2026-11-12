@@ -93,37 +93,18 @@ fun TelemetryHeaderPill(
             )
         }
 
-        // Right Pill — Live Telemetry Status Badge
-        val (dotColor, badgeText) = when (connectionState) {
-            is ConnectionState.LIVE -> {
-                PhosphorGreen to "● LIVE"
-            }
-            is ConnectionState.LIVE_NO_FIX -> {
-                RoyalBrass to "● LIVE · NO GPS FIX"
-            }
-            is ConnectionState.SYNCING -> {
-                RoyalBrass to "● SYNCING LOGS (${connectionState.progressPercent}%)"
-            }
-            is ConnectionState.PARKED -> {
-                val timeAgo = formatTimeAgo(connectionState.lastSeenTimestamp)
-                val label = if (timeAgo != null) "● PARKED • LAST SEEN $timeAgo" else "● PARKED"
-                MaterialTheme.colorScheme.onSurfaceVariant to label
-            }
-            is ConnectionState.CONNECTING -> {
-                RoyalBrass to "● CONNECTING…"
-            }
-            is ConnectionState.WAITING_FOR_TRACKER -> {
-                RoyalBrass to "● WAITING FOR TRACKER"
-            }
-            is ConnectionState.BROKER_ERROR -> {
-                SignalRed to "● BROKER ERROR"
-            }
-            is ConnectionState.BROKER_NOT_CONFIGURED -> {
-                MaterialTheme.colorScheme.onSurfaceVariant to "● SET UP BROKER"
-            }
-            is ConnectionState.NO_DEVICE -> {
-                MaterialTheme.colorScheme.onSurfaceVariant to "● NO TRACKER"
-            }
+        // Right Pill — Live Telemetry Status Badge (via StateMessageCatalog P2-U4)
+        val entry = StateMessageCatalog.resolve(connectionState)
+        val dotColor = when (connectionState) {
+            is ConnectionState.LIVE -> PhosphorGreen
+            is ConnectionState.LIVE_NO_FIX,
+            is ConnectionState.SYNCING,
+            is ConnectionState.CONNECTING,
+            is ConnectionState.WAITING_FOR_TRACKER -> RoyalBrass
+            is ConnectionState.BROKER_ERROR -> SignalRed
+            is ConnectionState.PARKED,
+            is ConnectionState.BROKER_NOT_CONFIGURED,
+            is ConnectionState.NO_DEVICE -> MaterialTheme.colorScheme.onSurfaceVariant
         }
 
         Row(
@@ -142,7 +123,7 @@ fun TelemetryHeaderPill(
             Spacer(modifier = Modifier.width(6.dp))
 
             Text(
-                text = badgeText.uppercase(),
+                text = entry.pillLabel.uppercase(),
                 color = dotColor,
                 fontSize = 10.sp,
                 fontWeight = FontWeight.Bold,
@@ -150,16 +131,4 @@ fun TelemetryHeaderPill(
             )
         }
     }
-}
-
-private fun formatTimeAgo(timestampSeconds: Long?): String? {
-    if (timestampSeconds == null || timestampSeconds <= 0L) return null
-    val diffSec = (System.currentTimeMillis() / 1000) - timestampSeconds
-    if (diffSec < 60) return "JUST NOW"
-    val minutes = diffSec / 60
-    if (minutes < 60) return "${minutes}m AGO"
-    val hours = minutes / 60
-    if (hours < 24) return "${hours}h AGO"
-    val days = hours / 24
-    return "${days}d AGO"
 }

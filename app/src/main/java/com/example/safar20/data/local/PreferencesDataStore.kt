@@ -21,6 +21,7 @@ class PreferencesDataStore(private val context: Context) {
         val KEY_MQTT_USERNAME = stringPreferencesKey("mqtt_username")
         val KEY_MQTT_PASSWORD = stringPreferencesKey("mqtt_password")
         val KEY_IS_DEV_MODE = booleanPreferencesKey("is_dev_mode")
+        val KEY_HAS_COMPLETED_ONBOARDING = booleanPreferencesKey("has_completed_onboarding")
 
         const val UNIT_KMH = "km/h"
         const val UNIT_MPH = "mph"
@@ -54,6 +55,11 @@ class PreferencesDataStore(private val context: Context) {
     val isDevModeEnabled: Flow<Boolean> = context.dataStore.data
         .map { preferences ->
             preferences[KEY_IS_DEV_MODE] ?: false
+        }
+
+    val hasCompletedOnboarding: Flow<Boolean> = context.dataStore.data
+        .map { preferences ->
+            preferences[KEY_HAS_COMPLETED_ONBOARDING] ?: false
         }
 
     suspend fun setDarkTheme(isDark: Boolean) {
@@ -96,6 +102,12 @@ class PreferencesDataStore(private val context: Context) {
     suspend fun setDevModeEnabled(enabled: Boolean) {
         context.dataStore.edit { preferences ->
             preferences[KEY_IS_DEV_MODE] = enabled
+        }
+    }
+
+    suspend fun setHasCompletedOnboarding(completed: Boolean) {
+        context.dataStore.edit { preferences ->
+            preferences[KEY_HAS_COMPLETED_ONBOARDING] = completed
         }
     }
 }

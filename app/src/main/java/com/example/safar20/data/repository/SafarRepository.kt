@@ -1,7 +1,6 @@
 package com.example.safar20.data.repository
 
 import android.content.Context
-import android.net.Uri
 import com.example.safar20.data.local.AppLog
 import com.example.safar20.data.local.PreferencesDataStore
 import com.example.safar20.data.local.SafarDatabase
@@ -126,6 +125,7 @@ class SafarRepository(
     val mqttUsername: Flow<String> = preferencesDataStore.mqttUsername
     val mqttPassword: Flow<String> = preferencesDataStore.mqttPassword
     val isDevModeEnabled: Flow<Boolean> = preferencesDataStore.isDevModeEnabled
+    val hasCompletedOnboarding: Flow<Boolean> = preferencesDataStore.hasCompletedOnboarding
 
     suspend fun setMqttBrokerConfig(uri: String, username: String, password: String) {
         preferencesDataStore.setMqttBrokerUri(uri)
@@ -135,6 +135,10 @@ class SafarRepository(
 
     suspend fun setDevModeEnabled(enabled: Boolean) {
         preferencesDataStore.setDevModeEnabled(enabled)
+    }
+
+    suspend fun setHasCompletedOnboarding(completed: Boolean) {
+        preferencesDataStore.setHasCompletedOnboarding(completed)
     }
 
     // --- Trip History Flows ---
@@ -161,6 +165,13 @@ class SafarRepository(
     // --- Actions ---
     suspend fun setSelectedDevice(deviceId: String) {
         deviceDao.setSelectedDevice(deviceId)
+    }
+
+    suspend fun renameDevice(deviceId: String, newName: String) {
+        val clean = newName.trim()
+        if (clean.isNotEmpty()) {
+            deviceDao.renameDevice(deviceId, clean)
+        }
     }
 
     suspend fun setDarkTheme(isDark: Boolean) {
@@ -384,57 +395,47 @@ class SafarRepository(
         )
     }
 
-    // --- QR Pairing & Device Add ---
-    /**
-     * Parses QR Payload URI:
-     * safar://pair?id=SAFAR_01&name=Classic350&pub=<64_HEX_NOSTR>&sec=<64_HEX_SECRET>&sim=+919876543210
-     */
+    // --- QR Pairing & Device Add (Supports QR v1 and QR v2 with embedded broker) ---
+    data class ParsedQrData(
+        val version: Int,
+        val deviceId: String,
+        val deviceName: String,
+        val pubKey: String,
+        val secretHex: String,
+        val simNumber: String,
+        val brokerUri: String?,
+        val brokerUsername: String?,
+        val brokerPassword: String?
+    )
+
     suspend fun parseAndPairQrUri(qrUriString: String): Result<DeviceEntity> {
-        return try {
-            val uri = Uri.parse(qrUriString)
-            if (uri.scheme != "safar" || uri.host != "pair") {
-                return Result.failure(IllegalArgumentException("Invalid QR Code Scheme. Expected safar://pair"))
-            }
-
-            val deviceId = uri.getQueryParameter("id") ?: uri.getQueryParameter("device_id")
-            if (deviceId.isNullOrEmpty()) {
-                return Result.failure(IllegalArgumentException("Device ID missing from QR Code"))
-            }
-
-            val deviceName = uri.getQueryParameter("name") ?: uri.getQueryParameter("device_name") ?: "Safar Tracker"
-            val pubKey = uri.getQueryParameter("pub") ?: uri.getQueryParameter("nostr_pub_key") ?: ""
-            val secretHex = uri.getQueryParameter("sec") ?: uri.getQueryParameter("shared_secret") ?: ""
-
-            val hex64Regex = Regex("^[0-9a-fA-F]{64}$")
-            if (!pubKey.matches(hex64Regex)) {
-                return Result.failure(IllegalArgumentException("Invalid QR: Public Key must be a 64-character hex string"))
-            }
-            if (!secretHex.matches(hex64Regex)) {
-                return Result.failure(IllegalArgumentException("Invalid QR: Shared Secret must be a 64-character hex string"))
-            }
-
-            var rawSim = uri.getQueryParameter("sim") ?: uri.getQueryParameter("sim_number") ?: ""
-            if (rawSim.startsWith(" ")) {
-                rawSim = "+" + rawSim.substring(1)
-            }
-            val simNumber = Uri.decode(rawSim).trim().let {
-                if (!it.startsWith("+") && it.startsWith("91") && it.length == 12) "+$it" else it
+        val parsedResult = parseQrUriData(qrUriString)
+        return parsedResult.mapCatching { parsed ->
+            // P2-U1: If QR v2 carries a valid ssl:// broker, apply broker config automatically.
+            // QR v1 (no broker param) preserves existing Settings broker values.
+            if (!parsed.brokerUri.isNullOrBlank()) {
+                setMqttBrokerConfig(
+                    uri = parsed.brokerUri,
+                    username = parsed.brokerUsername ?: "",
+                    password = parsed.brokerPassword ?: ""
+                )
+                AppLog.i("Pairing", "Applied broker config from QR v${parsed.version} for ${parsed.deviceId}")
             }
 
             val device = DeviceEntity(
-                deviceId = deviceId,
-                deviceName = deviceName,
-                nostrPubKey = pubKey,
-                sharedSecretHex = secretHex,
-                simNumber = simNumber,
+                deviceId = parsed.deviceId,
+                deviceName = parsed.deviceName,
+                nostrPubKey = parsed.pubKey,
+                sharedSecretHex = parsed.secretHex,
+                simNumber = parsed.simNumber,
                 lastSyncedTimestamp = 0L,
                 isSelected = true
             )
 
             deviceDao.insertAndSelectDevice(device)
-            Result.success(device)
-        } catch (e: Exception) {
-            Result.failure(e)
+            preferencesDataStore.setHasCompletedOnboarding(true)
+            AppLog.i("Pairing", "Paired tracker ${parsed.deviceId} (${parsed.deviceName})")
+            device
         }
     }
 
@@ -455,6 +456,8 @@ class SafarRepository(
             isSelected = true
         )
         deviceDao.insertAndSelectDevice(device)
+        preferencesDataStore.setHasCompletedOnboarding(true)
+        AppLog.i("Pairing", "Manually paired tracker $deviceId ($deviceName)")
         return device
     }
 
@@ -471,6 +474,78 @@ class SafarRepository(
     companion object {
         @Volatile
         private var INSTANCE: SafarRepository? = null
+
+        fun parseQrUriData(qrUriString: String): Result<ParsedQrData> {
+            return try {
+                val trimmed = qrUriString.trim()
+                val uri = java.net.URI(trimmed)
+                if (uri.scheme != "safar" || uri.host != "pair") {
+                    return Result.failure(IllegalArgumentException("Invalid QR Code Scheme. Expected safar://pair"))
+                }
+
+                val params = mutableMapOf<String, String>()
+                val rawQuery = uri.rawQuery ?: ""
+                for (pair in rawQuery.split("&")) {
+                    if (pair.isBlank()) continue
+                    val idx = pair.indexOf('=')
+                    if (idx > 0) {
+                        val k = java.net.URLDecoder.decode(pair.substring(0, idx), "UTF-8")
+                        val rawVal = pair.substring(idx + 1)
+                        val v = java.net.URLDecoder.decode(rawVal.replace("+", "%2B"), "UTF-8")
+                        params[k] = v
+                    }
+                }
+
+                val version = params["v"]?.toIntOrNull() ?: 1
+                val deviceId = (params["id"] ?: params["device_id"])?.trim()
+                if (deviceId.isNullOrEmpty()) {
+                    return Result.failure(IllegalArgumentException("Device ID missing from QR Code"))
+                }
+
+                val deviceName = (params["name"] ?: params["device_name"])?.trim()?.ifEmpty { "Safar Tracker" }
+                    ?: "Safar Tracker"
+                val pubKey = (params["pub"] ?: params["nostr_pub_key"] ?: "").trim()
+                val secretHex = (params["sec"] ?: params["shared_secret"] ?: "").trim()
+
+                val hex64Regex = Regex("^[0-9a-fA-F]{64}$")
+                if (!pubKey.matches(hex64Regex)) {
+                    return Result.failure(IllegalArgumentException("Invalid QR: Public Key must be a 64-character hex string"))
+                }
+                if (!secretHex.matches(hex64Regex)) {
+                    return Result.failure(IllegalArgumentException("Invalid QR: Shared Secret must be a 64-character hex string"))
+                }
+
+                val rawSim = (params["sim"] ?: params["sim_number"] ?: "").trim()
+                val simNumber = if (!rawSim.startsWith("+") && rawSim.startsWith("91") && rawSim.length == 12) {
+                    "+$rawSim"
+                } else {
+                    rawSim
+                }
+
+                val brokerUri = params["broker"]?.trim()?.takeIf { it.isNotEmpty() }
+                if (brokerUri != null && !brokerUri.startsWith("ssl://")) {
+                    return Result.failure(IllegalArgumentException("Invalid QR: Broker URI must start with ssl://"))
+                }
+                val brokerUser = params["bu"]?.trim()
+                val brokerPass = params["bp"]
+
+                Result.success(
+                    ParsedQrData(
+                        version = version,
+                        deviceId = deviceId,
+                        deviceName = deviceName,
+                        pubKey = pubKey,
+                        secretHex = secretHex,
+                        simNumber = simNumber,
+                        brokerUri = brokerUri,
+                        brokerUsername = brokerUser,
+                        brokerPassword = brokerPass
+                    )
+                )
+            } catch (e: Exception) {
+                Result.failure(IllegalArgumentException(e.message ?: "Invalid QR URI"))
+            }
+        }
 
         fun getInstance(
             context: Context,
