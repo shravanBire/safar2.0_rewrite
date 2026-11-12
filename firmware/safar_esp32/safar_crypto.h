@@ -4,10 +4,11 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <string.h>
+#include "safar_types.h"
 
 namespace SafarCrypto {
 
-// --- Portable SHA-256 & HMAC-SHA256 & HKDF-SHA256 ---
+// --- Portable SHA-256 ---
 static const uint32_t SHA256_K[64] = {
     0x428a2f98UL,0x71374491UL,0xb5c0fbcfUL,0xe9b5dba5UL,0x3956c25bUL,0x59f111f1UL,0x923f82a4UL,0xab1c5ed5UL,
     0xd807aa98UL,0x12835b01UL,0x243185beUL,0x550c7dc3UL,0x72be5d74UL,0x80deb1feUL,0x9bdc06a7UL,0xc19bf174UL,
@@ -109,47 +110,8 @@ inline void sha256(const uint8_t* data, size_t len, uint8_t out[32]) {
     sha256Final(ctx, out);
 }
 
-inline void hmacSha256(const uint8_t* key, size_t keyLen, const uint8_t* msg, size_t msgLen, uint8_t out[32]) {
-    uint8_t kPad[64];
-    memset(kPad, 0, 64);
-    if (keyLen > 64) {
-        sha256(key, keyLen, kPad);
-    } else {
-        memcpy(kPad, key, keyLen);
-    }
-    uint8_t iKeyPad[64], oKeyPad[64];
-    for (int i = 0; i < 64; ++i) {
-        iKeyPad[i] = kPad[i] ^ 0x36;
-        oKeyPad[i] = kPad[i] ^ 0x5c;
-    }
-    uint8_t innerHash[32];
-    Sha256Ctx ctx;
-    sha256Init(ctx);
-    sha256Update(ctx, iKeyPad, 64);
-    sha256Update(ctx, msg, msgLen);
-    sha256Final(ctx, innerHash);
-
-    sha256Init(ctx);
-    sha256Update(ctx, oKeyPad, 64);
-    sha256Update(ctx, innerHash, 32);
-    sha256Final(ctx, out);
-}
-
-// HKDF-SHA256 matching Kotlin ChaChaPolyCipher.deriveKeyFromHex
-inline void deriveChaChaKey(const uint8_t sharedSecret32[32], uint8_t outKey32[32]) {
-    const char* saltStr = "SAFAR2-v1";
-    const char* infoStr = "safar2-chacha20-key";
-    uint8_t prk[32];
-    hmacSha256(reinterpret_cast<const uint8_t*>(saltStr), strlen(saltStr), sharedSecret32, 32, prk);
-
-    uint8_t infoBuf[32];
-    size_t infoLen = strlen(infoStr);
-    memcpy(infoBuf, infoStr, infoLen);
-    infoBuf[infoLen] = 0x01;
-    hmacSha256(prk, 32, infoBuf, infoLen + 1, outKey32);
-}
-
 inline bool hexToBytes(const char* hex, uint8_t* out, size_t expectedBytes) {
+    if (!hex) return false;
     for (size_t i = 0; i < expectedBytes; ++i) {
         char c1 = hex[i * 2];
         char c2 = hex[i * 2 + 1];
@@ -166,16 +128,11 @@ inline bool hexToBytes(const char* hex, uint8_t* out, size_t expectedBytes) {
     return true;
 }
 
-// Derive 16-char lowercase hex topic ID: SHA256(lowercase(pubKeyHex))[0..15]
+// Derive 16-char lowercase hex topic ID: SHA256(pubKeyHex as UTF-8)[0..15]
+// Matches MqttTelemetrySource.deriveDeviceTopicId in Kotlin
 inline void deriveTopicId(const char* pubKeyHex64, char outTopic17[17]) {
-    char clean[64];
-    for (int i = 0; i < 64; ++i) {
-        char c = pubKeyHex64[i];
-        if (c >= 'A' && c <= 'F') c = static_cast<char>(c - 'A' + 'a');
-        clean[i] = c;
-    }
     uint8_t digest[32];
-    sha256(reinterpret_cast<const uint8_t*>(clean), 64, digest);
+    sha256(reinterpret_cast<const uint8_t*>(pubKeyHex64), 64, digest);
     const char* hexDigits = "0123456789abcdef";
     for (int i = 0; i < 8; ++i) {
         outTopic17[i * 2]     = hexDigits[(digest[i] >> 4) & 0x0F];
@@ -364,59 +321,79 @@ inline void poly1305Final(Poly1305State& st, uint8_t tag16[16]) {
     writeLE32(tag16 + 12, static_cast<uint32_t>(f3));
 }
 
-// Encrypt plaintext into: 12B nonce || ciphertext || 16B tag (total = plaintextLen + 28)
-inline void encryptFrame(
+/**
+ * Encrypts a plain packet (with 1B opcode at [0] and 2B CRC16 at the end)
+ * into the SAFAR 2.0 wire frame matching Kotlin CryptoEngine.encryptFrame:
+ *   Opcode (1B) | Nonce (12B) | Ciphertext (plainLen - 3) | Tag (16B)
+ * Total encrypted frame size = plainLen + 26.
+ * AAD is the 1-byte Opcode.
+ */
+inline size_t encryptPlainPacket(
     const uint8_t key32[32],
     const uint8_t nonce12[12],
-    const uint8_t* aad, size_t aadLen,
-    const uint8_t* plaintext, size_t plaintextLen,
+    const uint8_t* plainPacket,
+    size_t plainLen,
     uint8_t* outFrame
 ) {
-    memcpy(outFrame, nonce12, 12);
-    uint8_t* ciphertext = outFrame + 12;
-    chacha20Xor(key32, 1, nonce12, plaintext, plaintextLen, ciphertext);
+    if (plainLen < 4) return 0;
+    uint8_t opcode = plainPacket[0];
+    const uint8_t* innerPayload = plainPacket + 1;
+    size_t innerLen = plainLen - 3; // Strip 1B opcode and 2B trailing CRC16
+
+    outFrame[0] = opcode;
+    memcpy(outFrame + 1, nonce12, 12);
+    uint8_t* ciphertext = outFrame + 13;
+
+    chacha20Xor(key32, 1, nonce12, innerPayload, innerLen, ciphertext);
 
     uint8_t polyKeyBlock[64];
     chacha20Block(key32, 0, nonce12, polyKeyBlock);
 
     Poly1305State st;
     poly1305Init(st, polyKeyBlock);
-    poly1305UpdatePadded(st, aad, aadLen);
-    poly1305UpdatePadded(st, ciphertext, plaintextLen);
+    poly1305UpdatePadded(st, &opcode, 1);
+    poly1305UpdatePadded(st, ciphertext, innerLen);
 
     uint8_t lengthsBlock[16];
-    writeLE64(lengthsBlock + 0, static_cast<uint64_t>(aadLen));
-    writeLE64(lengthsBlock + 8, static_cast<uint64_t>(plaintextLen));
+    writeLE64(lengthsBlock + 0, 1ULL);
+    writeLE64(lengthsBlock + 8, static_cast<uint64_t>(innerLen));
     poly1305Block(st, lengthsBlock, 1);
 
-    poly1305Final(st, outFrame + 12 + plaintextLen);
+    poly1305Final(st, outFrame + 13 + innerLen);
+    return 1 + 12 + innerLen + 16;
 }
 
-// Decrypt frame (12B nonce || ciphertext || 16B tag). Returns true if tag matches.
-inline bool decryptFrame(
+/**
+ * Decrypts a SAFAR 2.0 wire frame:
+ *   Opcode (1B) | Nonce (12B) | Ciphertext (innerLen) | Tag (16B)
+ * Verifies 16B Poly1305 tag with AAD = 1B Opcode, and reconstructs the plain packet:
+ *   Opcode (1B) | InnerPayload (innerLen) | Recalculated CRC16 (2B Little-Endian)
+ * Returns reconstructed plain packet length (innerLen + 3), or 0 on authentication failure.
+ */
+inline size_t decryptToPlainPacket(
     const uint8_t key32[32],
-    const uint8_t* aad, size_t aadLen,
-    const uint8_t* frame, size_t frameLen,
-    uint8_t* outPlaintext,
-    uint8_t outNonce12[12]
+    const uint8_t* frame,
+    size_t frameLen,
+    uint8_t* outPlainPacket
 ) {
-    if (frameLen < 28) return false;
-    size_t cipherLen = frameLen - 28;
-    const uint8_t* nonce12 = frame;
-    const uint8_t* ciphertext = frame + 12;
-    const uint8_t* receivedTag = frame + 12 + cipherLen;
+    if (frameLen < 1 + 12 + 16) return 0;
+    uint8_t opcode = frame[0];
+    const uint8_t* nonce12 = frame + 1;
+    size_t innerLen = frameLen - 29;
+    const uint8_t* ciphertext = frame + 13;
+    const uint8_t* receivedTag = frame + 13 + innerLen;
 
     uint8_t polyKeyBlock[64];
     chacha20Block(key32, 0, nonce12, polyKeyBlock);
 
     Poly1305State st;
     poly1305Init(st, polyKeyBlock);
-    poly1305UpdatePadded(st, aad, aadLen);
-    poly1305UpdatePadded(st, ciphertext, cipherLen);
+    poly1305UpdatePadded(st, &opcode, 1);
+    poly1305UpdatePadded(st, ciphertext, innerLen);
 
     uint8_t lengthsBlock[16];
-    writeLE64(lengthsBlock + 0, static_cast<uint64_t>(aadLen));
-    writeLE64(lengthsBlock + 8, static_cast<uint64_t>(cipherLen));
+    writeLE64(lengthsBlock + 0, 1ULL);
+    writeLE64(lengthsBlock + 8, static_cast<uint64_t>(innerLen));
     poly1305Block(st, lengthsBlock, 1);
 
     uint8_t expectedTag[16];
@@ -426,11 +403,14 @@ inline bool decryptFrame(
     for (int i = 0; i < 16; ++i) {
         diff |= (expectedTag[i] ^ receivedTag[i]);
     }
-    if (diff != 0) return false;
+    if (diff != 0) return 0;
 
-    memcpy(outNonce12, nonce12, 12);
-    chacha20Xor(key32, 1, nonce12, ciphertext, cipherLen, outPlaintext);
-    return true;
+    outPlainPacket[0] = opcode;
+    chacha20Xor(key32, 1, nonce12, ciphertext, innerLen, outPlainPacket + 1);
+
+    uint16_t crc = calculateCrc16(outPlainPacket, 1 + innerLen);
+    writeU16LE(outPlainPacket + 1 + innerLen, crc);
+    return 1 + innerLen + 2;
 }
 
 } // namespace SafarCrypto

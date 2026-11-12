@@ -5,35 +5,26 @@
 #include "../safar_esp32/safar_types.h"
 #include "../safar_esp32/safar_crypto.h"
 
-static void testCrc16() {
-    const uint8_t sample[] = {0x01, 0x00, 0x00, 0x65, 0x92, 0x05, 0x80};
-    uint16_t crc = calculateCrc16(sample, sizeof(sample));
-    assert(crc != 0x0000 && crc != 0xFFFF);
-
-    // Deterministic check: same input yields identical CRC
-    uint16_t crc2 = calculateCrc16(sample, sizeof(sample));
-    assert(crc == crc2);
-
-    // Flipping 1 bit changes CRC
-    uint8_t mutated[sizeof(sample)];
-    memcpy(mutated, sample, sizeof(sample));
-    mutated[3] ^= 0x01;
-    assert(calculateCrc16(mutated, sizeof(mutated)) != crc);
-    printf("[PASS] testCrc16\n");
+static void testGoldenCrc16() {
+    // Matches Kotlin BinaryPacketCodecTest.testGoldenCrc16Vector ("123456789" -> 0x29B1)
+    const char* input = "123456789";
+    uint16_t crc = calculateCrc16(reinterpret_cast<const uint8_t*>(input), 9);
+    assert(crc == 0x29B1);
+    printf("[PASS] testGoldenCrc16\n");
 }
 
-static void testTripPointPackUnpack() {
+static void testTripPointPackUnpackLE() {
     TripPoint orig;
-    orig.timestamp     = 1711800000UL;
-    orig.lat_e7        = 211458000;
-    orig.lon_e7        = 790882000;
-    orig.speed_decideg = 543; // 54.3 km/h
-    orig.heading_div2  = 105; // 210 deg
-    orig.flags         = packFlags(true, true, false, 9);
+    orig.timestamp     = 1710000000UL;
+    orig.lat_e7        = 123456790;
+    orig.lon_e7        = 771234567;
+    orig.speed_decideg = 654; // 65.4 km/h
+    orig.heading_div2  = 90;  // 180 deg
+    orig.flags         = packFlags(true, false, true, 12);
 
     uint8_t wire[16];
-    packTripPointBE(orig, wire);
-    TripPoint decoded = unpackTripPointBE(wire);
+    packTripPointLE(orig, wire);
+    TripPoint decoded = unpackTripPointLE(wire);
 
     assert(decoded.timestamp     == orig.timestamp);
     assert(decoded.lat_e7        == orig.lat_e7);
@@ -42,96 +33,79 @@ static void testTripPointPackUnpack() {
     assert(decoded.heading_div2  == orig.heading_div2);
     assert(decoded.flags         == orig.flags);
     assert((decoded.flags & 0x01) != 0);
-    assert((decoded.flags & 0x02) != 0);
-    assert((decoded.flags & 0x04) == 0);
-    assert(unpackSatCount(decoded.flags) == 9);
-    printf("[PASS] testTripPointPackUnpack\n");
+    assert((decoded.flags & 0x02) == 0);
+    assert((decoded.flags & 0x04) != 0);
+    assert(unpackSatCount(decoded.flags) == 12);
+    printf("[PASS] testTripPointPackUnpackLE\n");
 }
 
-static void testHkdfAndChaChaPolyRoundTrip() {
-    const char* pubHex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-    const char* secHex = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
-
+static void testTopicIdAndAeadWireFormat() {
+    // Matches Kotlin BinaryPacketCodecTest.testDeriveDeviceTopicIdVector
+    const char* pubKey = "4d8a1c92b8e3f7a1029c83b4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4";
     char topicId[17];
-    SafarCrypto::deriveTopicId(pubHex, topicId);
-    assert(strlen(topicId) == 16);
+    SafarCrypto::deriveTopicId(pubKey, topicId);
+    assert(strcmp(topicId, "a996b58b008271c7") == 0);
 
-    uint8_t secret32[32];
-    assert(SafarCrypto::hexToBytes(secHex, secret32, 32));
-
+    // Matches Kotlin BinaryPacketCodecTest.testAeadEncryptedFrameExactSizes
+    const char* dummySecret = "a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90";
     uint8_t key32[32];
-    SafarCrypto::deriveChaChaKey(secret32, key32);
+    assert(SafarCrypto::hexToBytes(dummySecret, key32, 32));
 
-    // Build a 21-byte PKT_LIVE_TELEMETRY plaintext
-    TripPoint pt = {1711800060UL, 211458000, 790882000, 420, 90, packFlags(true, false, false, 8)};
-    uint8_t plain[21];
-    plain[0] = PKT_LIVE_TELEMETRY;
-    writeU16BE(plain + 1, 7);
-    packTripPointBE(pt, plain + 3);
-    uint16_t crc = calculateCrc16(plain, 19);
-    writeU16BE(plain + 19, crc);
+    TripPoint pt = {1710000000UL, 123400000, 775600000, 600, 90, packFlags(true, true, false, 12)};
+    uint8_t plainLive[LIVE_TELEMETRY_SIZE];
+    encodeLiveTelemetryPlain(1, pt, plainLive);
+    assert(verifyPlainCrc16(plainLive, LIVE_TELEMETRY_SIZE));
 
-    uint8_t nonce12[12];
-    writeU32BE(nonce12 + 0, 1711800060UL);
-    writeU32BE(nonce12 + 4, 0xAABBCCDDUL);
-    writeU32BE(nonce12 + 8, 1UL);
+    uint8_t nonce12[12] = {1,2,3,4,5,6,7,8,9,10,11,12};
+    uint8_t encryptedLive[64];
+    size_t encLen = SafarCrypto::encryptPlainPacket(key32, nonce12, plainLive, LIVE_TELEMETRY_SIZE, encryptedLive);
+    // 21B plain -> 47B encrypted (1B opcode + 12B nonce + 18B ciphertext + 16B tag)
+    assert(encLen == 47);
+    assert(encryptedLive[0] == PKT_LIVE_TELEMETRY);
 
-    const char* aad = "safar/topic/live";
-    uint8_t frame[21 + 28];
-    SafarCrypto::encryptFrame(key32, nonce12, reinterpret_cast<const uint8_t*>(aad), strlen(aad), plain, 21, frame);
+    uint8_t decryptedLive[64];
+    size_t decLen = SafarCrypto::decryptToPlainPacket(key32, encryptedLive, encLen, decryptedLive);
+    assert(decLen == LIVE_TELEMETRY_SIZE);
+    assert(memcmp(plainLive, decryptedLive, LIVE_TELEMETRY_SIZE) == 0);
+    assert(verifyPlainCrc16(decryptedLive, decLen));
 
-    uint8_t decrypted[21];
-    uint8_t outNonce[12];
-    bool ok = SafarCrypto::decryptFrame(key32, reinterpret_cast<const uint8_t*>(aad), strlen(aad), frame, sizeof(frame), decrypted, outNonce);
-    assert(ok);
-    assert(memcmp(plain, decrypted, 21) == 0);
-    assert(memcmp(nonce12, outNonce, 12) == 0);
+    // Tamper 1 bit -> must fail AEAD authentication
+    encryptedLive[20] ^= 0x01;
+    assert(SafarCrypto::decryptToPlainPacket(key32, encryptedLive, encLen, decryptedLive) == 0);
 
-    // Tamper 1 bit of ciphertext -> must fail AEAD verification
-    frame[15] ^= 0x01;
-    bool tamperedOk = SafarCrypto::decryptFrame(key32, reinterpret_cast<const uint8_t*>(aad), strlen(aad), frame, sizeof(frame), decrypted, outNonce);
-    assert(!tamperedOk);
-
-    printf("[PASS] testHkdfAndChaChaPolyRoundTrip\n");
+    printf("[PASS] testTopicIdAndAeadWireFormat\n");
 }
 
-static void testTimeTrustedReplayLogic() {
-    ReplayGuardState guard;
-    uint32_t currentEpoch = 1711800100UL;
+static void testCommandFreshnessAndReplayP1F2() {
+    CommandReplayState state;
+    uint32_t nowEpoch = 1711801000UL;
 
-    uint8_t nonce1[12];
-    writeU32BE(nonce1 + 0, 1711800095UL); // Fresh within 5s
-    writeU32BE(nonce1 + 4, 0x11223344UL); // Boot salt
-    writeU32BE(nonce1 + 8, 10UL);         // Counter = 10
+    // 1. Fresh HEARTBEAT (within ±600s) and seq=1 -> accepted
+    assert(verifyCommandFreshnessAndSeq(PKT_HEARTBEAT, nowEpoch - 100UL, 1, true, nowEpoch, state));
 
-    // 1. When timeTrusted == true, fresh nonce + counter 10 succeeds
-    assert(verifyIncomingReplayAndFreshness(true, currentEpoch, nonce1, guard));
+    // 2. Replayed seq=1 -> rejected
+    assert(!verifyCommandFreshnessAndSeq(PKT_HEARTBEAT, nowEpoch - 50UL, 1, true, nowEpoch, state));
 
-    // 2. Duplicate counter 10 with same bootSalt must be rejected when timeTrusted == true
-    assert(!verifyIncomingReplayAndFreshness(true, currentEpoch, nonce1, guard));
+    // 3. Stale HEARTBEAT (> 600s) even with newer seq=2 -> rejected
+    assert(!verifyCommandFreshnessAndSeq(PKT_HEARTBEAT, nowEpoch - 601UL, 2, true, nowEpoch, state));
 
-    // 3. Incremented counter 11 succeeds
-    writeU32BE(nonce1 + 8, 11UL);
-    assert(verifyIncomingReplayAndFreshness(true, currentEpoch, nonce1, guard));
+    // 4. Stale CLEAR_FLASH (> 120s) with newer seq=3 -> rejected
+    assert(!verifyCommandFreshnessAndSeq(PKT_CLEAR_FLASH, nowEpoch - 121UL, 3, true, nowEpoch, state));
 
-    // 4. Stale timestamp (> 300s drift) must be rejected when timeTrusted == true
-    uint8_t staleNonce[12];
-    writeU32BE(staleNonce + 0, currentEpoch - 600UL);
-    writeU32BE(staleNonce + 4, 0x11223344UL);
-    writeU32BE(staleNonce + 8, 12UL);
-    assert(!verifyIncomingReplayAndFreshness(true, currentEpoch, staleNonce, guard));
+    // 5. Fresh CLEAR_FLASH (within ±120s) with newer seq=4 -> accepted
+    assert(verifyCommandFreshnessAndSeq(PKT_CLEAR_FLASH, nowEpoch - 60UL, 4, true, nowEpoch, state));
 
-    // 5. When timeTrusted == false (cold boot before GPS/NTP fix), frame is accepted if AEAD + CRC16 pass
-    assert(verifyIncomingReplayAndFreshness(false, 42UL, staleNonce, guard));
+    // 6. When timeTrusted == false, command is accepted once AEAD+CRC pass
+    assert(verifyCommandFreshnessAndSeq(PKT_CLEAR_FLASH, 50UL, 4, false, 50UL, state));
 
-    printf("[PASS] testTimeTrustedReplayLogic\n");
+    printf("[PASS] testCommandFreshnessAndReplayP1F2\n");
 }
 
 int main() {
-    testCrc16();
-    testTripPointPackUnpack();
-    testHkdfAndChaChaPolyRoundTrip();
-    testTimeTrustedReplayLogic();
+    testGoldenCrc16();
+    testTripPointPackUnpackLE();
+    testTopicIdAndAeadWireFormat();
+    testCommandFreshnessAndReplayP1F2();
     printf("ALL TESTS PASSED\n");
     return 0;
 }
