@@ -279,7 +279,10 @@ fun TripperSpeedometer(
         }
 
         // Foreground Readout Overlay (Warning Strip, Speed, Mechanical Odometer)
-        val isConnectionActive = connectionState is ConnectionState.LIVE || connectionState is ConnectionState.SYNCING
+        val isGpsActive = connectionState is ConnectionState.LIVE
+        val isLinkActive = connectionState is ConnectionState.LIVE ||
+                connectionState is ConnectionState.LIVE_NO_FIX ||
+                connectionState is ConnectionState.SYNCING
 
         Column(
             horizontalAlignment = Alignment.CenterHorizontally,
@@ -293,8 +296,8 @@ fun TripperSpeedometer(
                 horizontalArrangement = Arrangement.spacedBy(12.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                WarningLightPill(label = "GPS", color = PhosphorGreen, isActive = isConnectionActive)
-                WarningLightPill(label = "LINK", color = RoyalBrass, isActive = isConnectionActive)
+                WarningLightPill(label = "GPS", color = PhosphorGreen, isActive = isGpsActive)
+                WarningLightPill(label = "LINK", color = RoyalBrass, isActive = isLinkActive)
                 WarningLightPill(label = "SOS", color = SignalRed, isActive = false)
             }
 
@@ -330,7 +333,7 @@ fun TripperSpeedometer(
                     .padding(horizontal = 6.dp, vertical = 3.dp)
             ) {
                 Text(
-                    text = "TRIP",
+                    text = "ODO",
                     color = MutedPewter,
                     fontFamily = Rajdhani,
                     fontWeight = FontWeight.Bold,

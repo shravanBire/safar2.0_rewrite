@@ -10,7 +10,7 @@ kotlin = "2.2.10"
 composeBom = "2026.02.01"
 
 # SAFAR 2.0 Dependencies
-room = "2.6.1"
+room = "2.7.1"
 datastore = "1.1.1"
 navigationCompose = "2.7.7"
 lifecycleViewModelCompose = "2.8.7"

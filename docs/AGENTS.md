@@ -1,35 +1,38 @@
 # AGENTS.md — AI Collaborator & Developer Master Guide for SAFAR 2.0
 
-> **INSTRUCTION FOR AI AGENTS:** Jab bhi tum is project me code likhe ya modify kare, pehle is file ko padhe. Hum SAFAR 1.0 (Supabase cloud prototype) ko **SAFAR 2.0 (Serverless P2P + Local RoomDB + Royal Enfield Retro-Moto UI)** me upgrade kar rahe hain.
+> **INSTRUCTION FOR AI AGENTS:** Read this file before modifying the project. SAFAR 2.0 uses **edge storage + relay-only MQTT server, end-to-end encrypted (ChaCha20-Poly1305)** + **Local RoomDB** + **Royal Enfield Retro-Moto UI**.
 
-## 1. SAFAR 1.0 Bugs That Must NEVER Be Repeated
-1. **NO Hardcoded Cloud Keys:** `SupabaseClientProvider.kt` aur Supabase dependencies (`postgrest-kt`, `realtime-kt`) ko completely remove karna hai.
-2. **NO Multiple ViewModel Instantiations:** SAFAR 1.0 me `HomeScreen`, `TripsScreen`, aur `SettingScreen` apna alag `DeviceRepository` banate the. SAFAR 2.0 me shared ViewModels use honge.
-3. **FIX Unit Conversion:** `UnitViewModel` me `mph` select hone par sirf text label nahi badalna hai; har speed aur distance value ko actual mathematical conversion (`* 0.621371`) se convert karna hai.
-4. **FIX MapLibre Polyline Updates:** `MapView.kt` ke `OpenStreetMapViewWithPolyline` me polyline `factory` block ke andar nahi, balki `update` block ke andar draw karni hai.
-5. **PERSIST Settings:** Theme aur Unit ko `DataStore` me save karna hai taaki app restart par reset na ho.
+## 1. Core Architecture Rules
+1. **Edge Storage + Relay-Only MQTT Server:** All trip points are stored on the ESP32 (`LittleFS`) and synced into the Android app's local `RoomDB` over TLS MQTT (`ssl://...:8883`) encrypted end-to-end with ChaCha20-Poly1305. The MQTT broker is an untrusted relay that never sees plaintext.
+2. **Single Shared ViewModel:** `HomeScreen`, `TripsScreen`, and `SettingScreen` share `SafarViewModel` backed by `SafarRepository`.
+3. **Accurate Unit Conversion & Trip Math:** Speed and distance conversions (`km/h` <-> `mph`) use `UnitConverter`, and all live/history distance and moving-average calculations use `TripMath`.
+4. **MapLibre Reactive Updates:** Marker, camera, and route polylines update inside the `AndroidView` `update` block.
+5. **Persist Settings & Diagnostics:** Theme, speed unit, and MQTT broker config persist in `PreferencesDataStore`; diagnostics persist in `AppLog` (`filesDir/safar_diagnostics.log`).
 
 ---
 
-## 2. Target Android Package Structure (`com.example.safar`)
+## 2. Android Package Structure (`com.example.safar20`)
 ```text
-com.example.safar/
+com.example.safar20/
 ├── data/
 │   ├── local/
-│   │   ├── SafarDatabase.kt          # RoomDatabase (@Database version = 1)
+│   │   ├── SafarDatabase.kt          # RoomDatabase (@Database version = 2)
+│   │   ├── TripMath.kt               # Shared Haversine, segment filter & moving average math
+│   │   ├── AppLog.kt                 # 500-line persistent diagnostic ring buffer + FileProvider share
+│   │   ├── UnitConverter.kt          # Metric/Imperial conversion utilities
 │   │   ├── dao/                      # DeviceDao & TripDao
 │   │   ├── entity/                   # DeviceEntity, TripSummaryEntity, LocationPointEntity
-│   │   └── PreferencesDataStore.kt   # Persists Theme & Unit
+│   │   └── PreferencesDataStore.kt   # Persists Theme, Unit, and MQTT Broker Config
 │   ├── network/
-│   │   ├── NostrSignalingClient.kt   # OkHttp WebSocket + SHA256 Relay Sharding
-│   │   ├── UdpHolePunchEngine.kt     # IPv6 DatagramChannel P2P Engine
-│   │   └── BinaryPacketCodec.kt      # Parses 16B TripPoint & 488B History Chunks + CRC16
+│   │   ├── MqttTelemetrySource.kt    # TLS 1.2+ MQTT client, sequential channel consumer, history sync
+│   │   ├── ChaChaPolyCipher.kt       # RFC 7539 ChaCha20-Poly1305 AEAD + HKDF-SHA256
+│   │   └── BinaryPacketCodec.kt      # Parses 16B TripPoint & 488B History Chunks + CRC16-CCITT
 │   └── repository/
-│       ├── DeviceRepository.kt       # RoomDB CRUD + QR URI parser
-│       └── TelemetryRepository.kt    # Coordinates P2P Live Stream & History Sync
+│       └── SafarRepository.kt        # Coordinates RoomDB, DataStore, QR pairing & TelemetrySource
 ├── ui/
-│   ├── theme/                        # Retro-Moto Palette (Obsidian, Brass, Copper)
+│   ├── theme/                        # Retro-Moto Palette (CrankcaseBlack, RoyalBrass, CafeCopper)
 │   ├── components/                   # TripperSpeedometer, TelemetryHeaderPill, RideTicketCard
 │   └── screens/                      # home, trips, settings
-├── viewModels/                       # DeviceViewModel, CockpitViewModel, TripsViewModel
+├── viewModels/                       # SafarViewModel
 └── MainActivity.kt
+```

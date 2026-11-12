@@ -1,9 +1,12 @@
 package com.example.safar20.data.network
 
+import com.example.safar20.data.local.AppLog
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -25,19 +28,20 @@ import java.net.URISyntaxException
 import java.net.UnknownHostException
 import java.security.MessageDigest
 import java.util.UUID
+import java.util.concurrent.atomic.AtomicBoolean
 import javax.net.ssl.SSLException
 
 /**
  * MQTT TelemetrySource implementation for SAFAR 2.0.
- * Connects to EMQX / MQTT broker over TLS on Dispatchers.IO, subscribes to device telemetry topics,
- * decrypts ChaCha20-Poly1305 frames, decodes wire protocol binary packets,
- * manages OpenSession, 20s watch-heartbeats, and transactional history chunk ACK ingestion.
+ * Connects to EMQX / MQTT broker over TLS, subscribes to pub-key-hash topics only,
+ * processes incoming frames sequentially via a single Channel consumer (P1-A3),
+ * and guards against duplicate connections (P1-A2).
  */
 class MqttTelemetrySource(
     val deviceId: String = "SAFAR_01",
     val nostrPubKey: String = "",
     val sharedSecretHex: String = "",
-    val brokerUri: String = "ssl://broker.hivemq.com:8883",
+    val brokerUri: String = "",
     val mqttUsername: String = "",
     val mqttPassword: String = "",
     val lastSyncedProvider: (suspend () -> Long)? = null,
@@ -63,6 +67,8 @@ class MqttTelemetrySource(
     private var mqttClient: MqttClient? = null
     @Volatile
     private var isConnected = false
+    private val isConnecting = AtomicBoolean(false)
+    private val isStopped = AtomicBoolean(false)
     private var heartbeatJob: Job? = null
     private var sequenceNumber = 1
     private var lastPacketAcceptedTime = 0L
@@ -78,48 +84,80 @@ class MqttTelemetrySource(
     val cmdTopic = "safar/v1/$topicDevId/cmd"
     val presenceTopic = "safar/v1/$topicDevId/presence"
 
-    private val candidateTopicIds: List<String> = buildList {
-        add(topicDevId)
-        val rawId = deviceId.trim().lowercase().replace(" ", "_")
-        if (rawId.isNotBlank() && rawId !in this) add(rawId)
+    private val subTopics = arrayOf(statusTopic, liveTopic, histTopic, presenceTopic)
+    private val subQos = intArrayOf(1, 1, 1, 1)
+
+    // Single sequential consumer channel for incoming MQTT frames (P1-A3)
+    private val incomingChannel = Channel<Pair<String, ByteArray>>(Channel.UNLIMITED)
+
+    init {
+        scope.launch {
+            for ((topic, payload) in incomingChannel) {
+                processIncomingPayload(topic, payload)
+            }
+        }
     }
 
-    private val allStatusTopics = candidateTopicIds.map { "safar/v1/$it/status" }.toSet()
-    private val allLiveTopics = candidateTopicIds.map { "safar/v1/$it/live" }.toSet()
-    private val allHistTopics = candidateTopicIds.map { "safar/v1/$it/hist" }.toSet()
-    private val allPresenceTopics = candidateTopicIds.map { "safar/v1/$it/presence" }.toSet()
-    private val allCmdTopics = candidateTopicIds.map { "safar/v1/$it/cmd" }
+    override fun isRunning(): Boolean = isConnected || isConnecting.get()
 
-    override fun isRunning(): Boolean = isConnected
+    @Synchronized
+    private fun closeOldClient() {
+        val old = mqttClient
+        mqttClient = null
+        isConnected = false
+        if (old != null) {
+            try {
+                old.setCallback(null)
+                if (old.isConnected) {
+                    old.disconnectForcibly(1000, 1000)
+                }
+            } catch (_: Exception) {
+            }
+            try {
+                old.close(true)
+            } catch (_: Exception) {
+            }
+        }
+    }
 
     override fun start() {
-        if (isConnected || deviceId.isBlank()) return
+        if (isStopped.get() || isConnected || !isConnecting.compareAndSet(false, true)) return
+        if (deviceId.isBlank() || brokerUri.isBlank()) {
+            isConnecting.set(false)
+            return
+        }
 
         if (!isValidSecretHex(sharedSecretHex)) {
-            _linkState.value = LinkState.Error("Tracker has no valid encryption key. Re-pair using QR")
+            isConnecting.set(false)
+            val err = "Tracker has no valid encryption key. Re-pair using QR"
+            _linkState.value = LinkState.Error(err)
+            AppLog.e("MQTT", err)
             return
         }
 
         _linkState.value = LinkState.Connecting
+        AppLog.i("MQTT", "Connecting to broker for topicId=$topicDevId")
 
         scope.launch {
             try {
+                closeOldClient()
+
                 val clientId = "SafarApp_" + UUID.randomUUID().toString().take(8)
-                val client = MqttClient(brokerUri, clientId, MemoryPersistence())
+                val client = MqttClient(brokerUri.trim(), clientId, MemoryPersistence())
                 mqttClient = client
 
                 client.setCallback(object : MqttCallbackExtended {
                     override fun connectComplete(reconnect: Boolean, serverURI: String?) {
                         isConnected = true
+                        isConnecting.set(false)
                         _linkState.value = LinkState.Connected
                         liveReplayValidator.reset()
                         statusReplayValidator.reset()
                         lastPacketAcceptedTime = System.currentTimeMillis()
+                        AppLog.i("MQTT", "Connected (reconnect=$reconnect) topicId=$topicDevId")
 
                         scope.launch {
                             try {
-                                val subTopics = (allStatusTopics + allLiveTopics + allHistTopics + allPresenceTopics).toTypedArray()
-                                val subQos = IntArray(subTopics.size) { 1 }
                                 client.subscribe(subTopics, subQos)
 
                                 val freshLastSynced = lastSyncedProvider?.invoke() ?: 0L
@@ -129,20 +167,24 @@ class MqttTelemetrySource(
                                 )
                                 publishCommand(openSessionPacket)
                                 startHeartbeatLoop()
-                            } catch (_: Exception) {
+                            } catch (e: Exception) {
+                                AppLog.e("MQTT", "Post-connect subscribe/openSession failed", e)
                             }
                         }
                     }
 
                     override fun connectionLost(cause: Throwable?) {
                         isConnected = false
+                        isConnecting.set(true)
                         stopHeartbeat()
                         _linkState.value = LinkState.Connecting
+                        AppLog.e("MQTT", "Connection lost; auto-reconnecting", cause)
                     }
 
                     override fun messageArrived(topic: String, message: MqttMessage) {
-                        scope.launch {
-                            processIncomingMessage(topic, message)
+                        val bytes = message.payload ?: return
+                        if (bytes.isNotEmpty()) {
+                            incomingChannel.trySend(topic to bytes)
                         }
                     }
 
@@ -161,32 +203,24 @@ class MqttTelemetrySource(
                 client.connect(options)
             } catch (e: Exception) {
                 isConnected = false
+                isConnecting.set(false)
                 val errorMsg = mapExceptionToHumanMessage(e)
                 _linkState.value = LinkState.Error(errorMsg)
+                AppLog.e("MQTT", "Connect failed: $errorMsg", e)
             }
         }
     }
 
     override fun stop() {
+        if (!isStopped.compareAndSet(false, true)) return
         stopHeartbeat()
+        isConnecting.set(false)
         _linkState.value = LinkState.Idle
         _trackerOnline.value = null
-        scope.launch {
-            try {
-                mqttClient?.let { client ->
-                    if (client.isConnected) {
-                        val subTopics = (allStatusTopics + allLiveTopics + allHistTopics + allPresenceTopics).toTypedArray()
-                        client.unsubscribe(subTopics)
-                        client.disconnect()
-                    }
-                    client.close()
-                }
-            } catch (_: Exception) {
-            } finally {
-                mqttClient = null
-                isConnected = false
-            }
-        }
+        incomingChannel.close()
+        closeOldClient()
+        AppLog.i("MQTT", "Disconnected and stopped source for topicId=$topicDevId")
+        scope.cancel()
     }
 
     fun sendClearFlashCommand(mode: Int = 0, upToTimestamp: Long = System.currentTimeMillis() / 1000): Boolean {
@@ -221,10 +255,8 @@ class MqttTelemetrySource(
 
         return try {
             val payloadToSend = CryptoEngine.encryptFrame(commandPacket, sharedSecretHex) ?: return false
-            for (targetCmdTopic in allCmdTopics) {
-                val message = MqttMessage(payloadToSend).apply { qos = 1 }
-                client.publish(targetCmdTopic, message)
-            }
+            val message = MqttMessage(payloadToSend).apply { qos = 1 }
+            client.publish(cmdTopic, message)
             true
         } catch (_: Exception) {
             false
@@ -250,11 +282,14 @@ class MqttTelemetrySource(
         heartbeatJob = null
     }
 
-    private suspend fun processIncomingMessage(topic: String, message: MqttMessage) {
-        val rawBytes = message.payload ?: return
+    fun enqueueMessageForTest(topic: String, rawBytes: ByteArray) {
+        incomingChannel.trySend(topic to rawBytes)
+    }
+
+    suspend fun processIncomingPayload(topic: String, rawBytes: ByteArray) {
         if (rawBytes.isEmpty()) return
 
-        if (topic in allPresenceTopics) {
+        if (topic == presenceTopic) {
             val presenceStr = String(rawBytes, Charsets.UTF_8).trim()
             _trackerOnline.value = (presenceStr == "1")
             return
@@ -278,7 +313,7 @@ class MqttTelemetrySource(
         }
 
         when (topic) {
-            in allStatusTopics -> {
+            statusTopic -> {
                 val livePacket = BinaryPacketCodec.decodeLiveTelemetry(plainData)
                 if (livePacket != null && livePacket.isValidCrc) {
                     if (statusReplayValidator.validateAndRecord(livePacket.tripPoint.timestamp, livePacket.sequenceNumber, checkStale = false)) {
@@ -287,7 +322,7 @@ class MqttTelemetrySource(
                     }
                 }
             }
-            in allLiveTopics -> {
+            liveTopic -> {
                 val livePacket = BinaryPacketCodec.decodeLiveTelemetry(plainData)
                 if (livePacket != null && livePacket.isValidCrc) {
                     if (liveReplayValidator.validateAndRecord(livePacket.tripPoint.timestamp, livePacket.sequenceNumber, checkStale = true)) {
@@ -297,7 +332,7 @@ class MqttTelemetrySource(
                     }
                 }
             }
-            in allHistTopics -> {
+            histTopic -> {
                 val chunkPacket = BinaryPacketCodec.decodeHistoryChunk(plainData)
                 if (chunkPacket != null && chunkPacket.isValidCrc) {
                     lastPacketAcceptedTime = now
@@ -320,6 +355,8 @@ class MqttTelemetrySource(
             return clean.length == 64 && clean.matches(Regex("^[0-9a-fA-F]{64}$"))
         }
 
+        fun deriveDeviceTopicId(nostrPubKey: String): String = deriveDeviceTopicId("", nostrPubKey)
+
         fun deriveDeviceTopicId(deviceId: String, nostrPubKey: String): String {
             val cleanPub = nostrPubKey.trim()
             if (cleanPub.length == 64) {
@@ -329,10 +366,10 @@ class MqttTelemetrySource(
                     val hex = hash.joinToString("") { "%02x".format(it) }
                     hex.take(16).lowercase()
                 } catch (_: Exception) {
-                    deviceId.lowercase().replace(" ", "_")
+                    "0000000000000000"
                 }
             }
-            return deviceId.lowercase().replace(" ", "_")
+            return "0000000000000000"
         }
 
         fun mapExceptionToHumanMessage(e: Exception): String {
@@ -347,3 +384,4 @@ class MqttTelemetrySource(
         }
     }
 }
+

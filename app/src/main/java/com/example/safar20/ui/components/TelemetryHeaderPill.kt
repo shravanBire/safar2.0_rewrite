@@ -36,6 +36,7 @@ sealed interface ConnectionState {
     data class BROKER_ERROR(val message: String) : ConnectionState
     object WAITING_FOR_TRACKER : ConnectionState
     object LIVE : ConnectionState
+    object LIVE_NO_FIX : ConnectionState
     data class SYNCING(val progressPercent: Int) : ConnectionState
     data class PARKED(val lastSeenTimestamp: Long?) : ConnectionState
 }
@@ -96,6 +97,9 @@ fun TelemetryHeaderPill(
         val (dotColor, badgeText) = when (connectionState) {
             is ConnectionState.LIVE -> {
                 PhosphorGreen to "● LIVE"
+            }
+            is ConnectionState.LIVE_NO_FIX -> {
+                RoyalBrass to "● LIVE · NO GPS FIX"
             }
             is ConnectionState.SYNCING -> {
                 RoyalBrass to "● SYNCING LOGS (${connectionState.progressPercent}%)"

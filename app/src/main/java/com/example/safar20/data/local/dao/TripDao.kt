@@ -15,6 +15,9 @@ interface TripDao {
     @Query("SELECT * FROM trip_summaries WHERE device_id = :deviceId ORDER BY start_timestamp DESC")
     fun getTripsForDevice(deviceId: String): Flow<List<TripSummaryEntity>>
 
+    @Query("SELECT COALESCE(SUM(distance_km), 0.0) FROM trip_summaries WHERE device_id = :deviceId AND trip_id NOT LIKE 'DEMO_%'")
+    fun getSavedOdoDistanceKm(deviceId: String): Flow<Double>
+
     @Query("SELECT * FROM trip_summaries WHERE trip_id = :tripId")
     suspend fun getTripById(tripId: String): TripSummaryEntity?
 

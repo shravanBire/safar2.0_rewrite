@@ -2,14 +2,15 @@ package com.example.safar20.data.repository
 
 import android.content.Context
 import android.net.Uri
+import com.example.safar20.data.local.AppLog
 import com.example.safar20.data.local.PreferencesDataStore
 import com.example.safar20.data.local.SafarDatabase
+import com.example.safar20.data.local.TripMath
 import com.example.safar20.data.local.entity.DeviceEntity
 import com.example.safar20.data.local.entity.LocationPointEntity
 import com.example.safar20.data.local.entity.TripSummaryEntity
 import com.example.safar20.data.network.BinaryPacketCodec
 import com.example.safar20.data.network.LinkState
-import com.example.safar20.data.network.MockEsp32Simulator
 import com.example.safar20.data.network.MockTelemetrySource
 import com.example.safar20.data.network.MqttTelemetrySource
 import com.example.safar20.data.network.TelemetrySource
@@ -26,10 +27,6 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
-import kotlin.math.atan2
-import kotlin.math.cos
-import kotlin.math.sin
-import kotlin.math.sqrt
 
 /**
  * Unified Repository for SAFAR 2.0.
@@ -143,6 +140,10 @@ class SafarRepository(
     // --- Trip History Flows ---
     fun getTripsForDevice(deviceId: String): Flow<List<TripSummaryEntity>> {
         return tripDao.getTripsForDevice(deviceId)
+    }
+
+    fun getSavedOdoDistanceKm(deviceId: String): Flow<Double> {
+        return tripDao.getSavedOdoDistanceKm(deviceId)
     }
 
     fun getPointsForTrip(tripId: String): Flow<List<LocationPointEntity>> {
@@ -350,8 +351,10 @@ class SafarRepository(
                 newLastSyncedTimestamp = committedMaxTs,
                 deviceDao = deviceDao
             )
+            AppLog.i("Repo", "Saved history chunk ${chunkPacket.chunkId + 1}/${chunkPacket.totalChunks} (${newPoints.size} pts)")
             true
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            AppLog.e("Repo", "Failed saving history chunk: ${e.message}")
             false
         }
     }
@@ -365,22 +368,9 @@ class SafarRepository(
         val endTs = pts.last().timestamp
         val durationMins = maxOf(1, ((endTs - startTs) / 60).toInt())
 
-        var distMeters = 0.0
-        var maxSpeed = 0.0f
-        var sumSpeed = 0.0
-
-        for (i in pts.indices) {
-            val pt = pts[i]
-            if (pt.speedKmh > maxSpeed) maxSpeed = pt.speedKmh
-            sumSpeed += pt.speedKmh
-
-            if (i > 0) {
-                val prev = pts[i - 1]
-                distMeters += calculateDistanceMeters(prev.latitude, prev.longitude, pt.latitude, pt.longitude)
-            }
-        }
-        val distKm = distMeters / 1000.0
-        val avgSpeed = if (pts.isNotEmpty()) sumSpeed / pts.size else 0.0
+        val distKm = TripMath.distanceKm(pts)
+        val avgSpeed = TripMath.movingAvgSpeedKmh(pts)
+        val maxSpeed = pts.maxOfOrNull { it.speedKmh.toDouble() } ?: 0.0
 
         return TripSummaryEntity(
             tripId = tripId,
@@ -390,19 +380,8 @@ class SafarRepository(
             distanceKm = distKm,
             durationMinutes = durationMins,
             avgSpeedKmh = avgSpeed,
-            maxSpeedKmh = maxSpeed.toDouble()
+            maxSpeedKmh = maxSpeed
         )
-    }
-
-    private fun calculateDistanceMeters(lat1: Double, lon1: Double, lat2: Double, lon2: Double): Double {
-        val r = 6371000.0
-        val dLat = Math.toRadians(lat2 - lat1)
-        val dLon = Math.toRadians(lon2 - lon1)
-        val a = sin(dLat / 2) * sin(dLat / 2) +
-                cos(Math.toRadians(lat1)) * cos(Math.toRadians(lat2)) *
-                sin(dLon / 2) * sin(dLon / 2)
-        val c = 2 * atan2(sqrt(a), sqrt(1 - a))
-        return r * c
     }
 
     // --- QR Pairing & Device Add ---

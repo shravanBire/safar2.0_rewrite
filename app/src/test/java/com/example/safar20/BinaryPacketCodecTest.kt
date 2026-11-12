@@ -362,7 +362,7 @@ class BinaryPacketCodecTest {
         val derivedId = MqttTelemetrySource.deriveDeviceTopicId("SAFAR_01", pubKey)
         assertEquals("a996b58b008271c7", derivedId)
 
-        val fallbackId = MqttTelemetrySource.deriveDeviceTopicId("SAFAR_01", "")
-        assertEquals("safar_01", fallbackId)
+        val noFallbackId = MqttTelemetrySource.deriveDeviceTopicId("SAFAR_01", "")
+        assertEquals("0000000000000000", noFallbackId)
     }
 }

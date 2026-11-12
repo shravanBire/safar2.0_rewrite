@@ -47,6 +47,7 @@ import androidx.lifecycle.DefaultLifecycleObserver
 import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.ProcessLifecycleOwner
 import androidx.lifecycle.ViewModelProvider
+import com.example.safar20.data.local.AppLog
 import com.example.safar20.ui.components.IgnitionSplash
 import com.example.safar20.ui.screens.home.HomeScreen
 import com.example.safar20.ui.screens.settings.SettingScreen
@@ -63,6 +64,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        AppLog.init(applicationContext)
         enableEdgeToEdge()
 
         val vm = ViewModelProvider(this, SafarViewModel.Factory(applicationContext))[SafarViewModel::class.java]

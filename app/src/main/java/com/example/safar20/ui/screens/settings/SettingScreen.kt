@@ -27,6 +27,7 @@ import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.DeleteSweep
 import androidx.compose.material.icons.filled.QrCodeScanner
 import androidx.compose.material.icons.filled.Router
+import androidx.compose.material.icons.filled.Share
 import androidx.compose.material.icons.filled.Visibility
 import androidx.compose.material.icons.filled.VisibilityOff
 import androidx.compose.material3.AlertDialog
@@ -60,6 +61,7 @@ import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.example.safar20.data.local.AppLog
 import com.example.safar20.data.local.entity.DeviceEntity
 import com.example.safar20.data.network.LinkState
 import com.example.safar20.ui.components.BrassCard
@@ -440,7 +442,6 @@ fun SettingScreen(
                                         }
                                     }
                                     val topicId = com.example.safar20.data.network.MqttTelemetrySource.deriveDeviceTopicId(
-                                        device.deviceId,
                                         device.nostrPubKey
                                     )
                                     Text(
@@ -644,11 +645,39 @@ fun SettingScreen(
                 }
                 Spacer(modifier = Modifier.height(4.dp))
                 Text(
-                    text = "Edge storage + relay-only server",
+                    text = "Edge storage + relay-only MQTT server, end-to-end encrypted",
                     fontFamily = Inter,
                     fontSize = 12.sp,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
+                Spacer(modifier = Modifier.height(12.dp))
+                OutlinedButton(
+                    onClick = {
+                        val shared = AppLog.shareDiagnostics(context)
+                        if (!shared) {
+                            flashMessage = "Could not open share sheet for diagnostics"
+                        }
+                    },
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(12.dp),
+                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline)
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.Share,
+                        contentDescription = null,
+                        tint = MaterialTheme.colorScheme.primary,
+                        modifier = Modifier.size(16.dp)
+                    )
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text(
+                        text = "EXPORT DIAGNOSTICS",
+                        fontFamily = Rajdhani,
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 12.sp,
+                        letterSpacing = 1.sp,
+                        color = MaterialTheme.colorScheme.primary
+                    )
+                }
             }
         }
 

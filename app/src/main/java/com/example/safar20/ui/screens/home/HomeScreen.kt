@@ -93,9 +93,11 @@ fun HomeScreen(
     var qrErrorMessage by remember { mutableStateOf<String?>(null) }
     var isMapExpanded by remember { mutableStateOf(false) }
 
-    val realOrSavedLat = liveTelemetry?.latitude ?: selectedDevice?.lastLat
-    val realOrSavedLon = liveTelemetry?.longitude ?: selectedDevice?.lastLon
-    val currentSpeed = if (hasLiveData && connectionState is ConnectionState.LIVE) liveTelemetry?.speedKmh ?: 0.0f else 0.0f
+    val hasValidLiveFix = liveTelemetry != null && (liveTelemetry?.satCount ?: 0) > 0
+    val realOrSavedLat = if (hasValidLiveFix) liveTelemetry?.latitude else selectedDevice?.lastLat
+    val realOrSavedLon = if (hasValidLiveFix) liveTelemetry?.longitude else selectedDevice?.lastLon
+    val isLiveSession = connectionState is ConnectionState.LIVE || connectionState is ConnectionState.LIVE_NO_FIX
+    val currentSpeed = if (hasLiveData && isLiveSession) liveTelemetry?.speedKmh ?: 0.0f else 0.0f
     val currentHeading = liveTelemetry?.heading ?: 210
 
     var mapCenterLat by remember { mutableDoubleStateOf(realOrSavedLat ?: 21.1458) }
@@ -239,7 +241,7 @@ fun HomeScreen(
                 TripperSpeedometer(
                     speedKmh = currentSpeed,
                     unit = speedUnit,
-                    odoDistanceKm = if (hasLiveData) liveOdoKm else 0.0,
+                    odoDistanceKm = liveOdoKm,
                     gaugeSize = 300.dp,
                     connectionState = connectionState
                 )
@@ -370,10 +372,15 @@ fun HomeScreen(
                     }
                 }
 
-                if (connectionState is ConnectionState.LIVE || connectionState is ConnectionState.PARKED) {
-                    val isLiveBadge = connectionState is ConnectionState.LIVE
-                    val badgeColor = if (isLiveBadge) PhosphorGreen else RoyalBrass
-                    val badgeLabel = if (isLiveBadge) "LIVE" else "PARKED"
+                if (connectionState is ConnectionState.LIVE ||
+                    connectionState is ConnectionState.LIVE_NO_FIX ||
+                    connectionState is ConnectionState.PARKED
+                ) {
+                    val (badgeColor, badgeLabel) = when (connectionState) {
+                        is ConnectionState.LIVE -> PhosphorGreen to "LIVE"
+                        is ConnectionState.LIVE_NO_FIX -> RoyalBrass to "NO GPS FIX"
+                        else -> RoyalBrass to "PARKED"
+                    }
                     Row(
                         modifier = Modifier
                             .align(Alignment.TopStart)
