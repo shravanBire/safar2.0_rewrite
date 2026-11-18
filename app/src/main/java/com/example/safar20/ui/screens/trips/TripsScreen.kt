@@ -21,6 +21,7 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.CloudDownload
 import androidx.compose.material.icons.filled.Speed
 import androidx.compose.material3.Button
@@ -28,6 +29,7 @@ import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
@@ -48,6 +50,9 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.example.safar20.data.local.UnitConverter
+import com.example.safar20.ui.components.BrassCard
+import com.example.safar20.ui.components.RideDetailDialog
 import com.example.safar20.ui.components.RideTicketCard
 import com.example.safar20.ui.components.SectionLabel
 import com.example.safar20.ui.theme.BebasNeue
@@ -80,8 +85,11 @@ fun TripsScreen(
     val selectedTripPoints by viewModel.selectedTripPoints.collectAsState()
     val speedUnit by viewModel.speedUnit.collectAsState()
     val historySyncProgress by viewModel.historySyncProgress.collectAsState()
+    val customTripNames by viewModel.customTripNames.collectAsState()
+    val completedRideSummary by viewModel.completedRideSummary.collectAsState()
 
     var isPullRefreshing by remember { mutableStateOf(false) }
+    var detailDialogTripId by remember { mutableStateOf<String?>(null) }
 
     val dateList = remember {
         (0..13).map { daysAgo ->
@@ -240,6 +248,48 @@ fun TripsScreen(
                     color = RoyalBrass,
                     trackColor = MaterialTheme.colorScheme.surface
                 )
+            }
+
+            // Ride-Complete Summary Card (P3-R7)
+            if (completedRideSummary != null) {
+                val summary = completedRideSummary!!
+                val distStr = UnitConverter.formatDistance(summary.distanceKm, speedUnit, 1)
+                val maxStr = UnitConverter.formatSpeed(summary.maxSpeedKmh, speedUnit, 0)
+                Spacer(modifier = Modifier.height(8.dp))
+                BrassCard(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable {
+                            viewModel.selectTripForMapPreview(summary.tripId)
+                            detailDialogTripId = summary.tripId
+                        }
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            text = "Ride complete · $distStr · max $maxStr",
+                            fontFamily = Rajdhani,
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 14.sp,
+                            color = PhosphorGreen,
+                            modifier = Modifier.weight(1f)
+                        )
+                        IconButton(
+                            onClick = { viewModel.dismissCompletedRideSummary() },
+                            modifier = Modifier.size(24.dp)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Close,
+                                contentDescription = "Dismiss",
+                                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.size(16.dp)
+                            )
+                        }
+                    }
+                }
             }
         }
 
@@ -447,10 +497,10 @@ fun TripsScreen(
                                 speedUnit = speedUnit,
                                 isSelected = isSelected,
                                 routePoints = if (isSelected) selectedTripPoints else emptyList(),
+                                customName = customTripNames[trip.tripId],
                                 onCardClick = {
-                                    viewModel.selectTripForMapPreview(
-                                        if (isSelected) null else trip.tripId
-                                    )
+                                    viewModel.selectTripForMapPreview(trip.tripId)
+                                    detailDialogTripId = trip.tripId
                                 }
                             )
                         }
@@ -458,5 +508,27 @@ fun TripsScreen(
                 }
             }
         }
+    }
+
+    // Ride Detail Screen Dialog (P3-R1, P3-R2, P3-R3)
+    val detailTrip = remember(detailDialogTripId, tripHistory) {
+        tripHistory.find { it.tripId == detailDialogTripId }
+    }
+    if (detailTrip != null) {
+        RideDetailDialog(
+            trip = detailTrip,
+            routePoints = if (detailTrip.tripId == selectedTripId) selectedTripPoints else emptyList(),
+            customName = customTripNames[detailTrip.tripId],
+            speedUnit = speedUnit,
+            onDismiss = { detailDialogTripId = null },
+            onRename = { newName ->
+                viewModel.renameTrip(detailTrip.tripId, newName)
+            },
+            onDelete = {
+                viewModel.deleteTrip(detailTrip.tripId)
+                detailDialogTripId = null
+            },
+            onExportFailed = { msg -> viewModel.showTransientMessage(msg) }
+        )
     }
 }

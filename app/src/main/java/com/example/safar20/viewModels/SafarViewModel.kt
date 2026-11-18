@@ -6,6 +6,8 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
 import com.example.safar20.data.local.AppLog
+import com.example.safar20.data.local.EmergencyContact
+import com.example.safar20.data.local.PreferencesDataStore
 import com.example.safar20.data.local.TripMath
 import com.example.safar20.data.local.entity.DeviceEntity
 import com.example.safar20.data.local.entity.LocationPointEntity
@@ -71,11 +73,22 @@ class SafarViewModel(
     val linkState: StateFlow<LinkState> = repository.linkState
     val trackerOnline: StateFlow<Boolean?> = repository.trackerOnline
     val historySyncProgress: StateFlow<Int?> = repository.historySyncProgress
+    val completedRideSummary: StateFlow<TripSummaryEntity?> = repository.completedRideSummary
+
     val isDevModeEnabled: StateFlow<Boolean> = repository.isDevModeEnabled
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), false)
 
     val hasCompletedOnboarding: StateFlow<Boolean> = repository.hasCompletedOnboarding
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), true)
+
+    val emergencyContacts: StateFlow<List<EmergencyContact>> = repository.emergencyContacts
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), listOf(EmergencyContact(), EmergencyContact()))
+
+    val customTripNames: StateFlow<Map<String, String>> = repository.customTripNames
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyMap())
+
+    private val _activeSosEvent = MutableStateFlow<BinaryPacketCodec.SosEventPacket?>(null)
+    val activeSosEvent: StateFlow<BinaryPacketCodec.SosEventPacket?> = _activeSosEvent.asStateFlow()
 
     private val _transientMessage = MutableStateFlow<String?>(null)
     val transientMessage: StateFlow<String?> = _transientMessage.asStateFlow()
@@ -357,6 +370,13 @@ class SafarViewModel(
                         }
                     }
                 }
+            }
+        }
+
+        // Collect SOS events from Repository (P3-R6)
+        viewModelScope.launch {
+            repository.sosEventStream.collect { sosEvent ->
+                _activeSosEvent.value = sosEvent
             }
         }
 
@@ -643,6 +663,58 @@ class SafarViewModel(
             repository.deleteDeviceAndHistory(deviceId)
             showTransientMessage("Tracker deleted")
         }
+    }
+
+    fun saveEmergencyContacts(contact1: EmergencyContact, contact2: EmergencyContact) {
+        if (!PreferencesDataStore.isValidEmergencyNumber(contact1.number) ||
+            !PreferencesDataStore.isValidEmergencyNumber(contact2.number)
+        ) {
+            showTransientMessage("Invalid phone number. Use E.164 format (e.g. +919876543210)")
+            return
+        }
+        viewModelScope.launch {
+            val synced = repository.saveAndSyncEmergencyContacts(contact1, contact2)
+            showTransientMessage(
+                if (synced) "Emergency contacts saved & synced to tracker"
+                else "Emergency contacts saved on phone (will sync when tracker connects)"
+            )
+        }
+    }
+
+    fun renameTrip(tripId: String, newName: String) {
+        viewModelScope.launch {
+            repository.renameTrip(tripId, newName)
+            showTransientMessage("Ride renamed")
+        }
+    }
+
+    fun deleteTrip(tripId: String) {
+        viewModelScope.launch {
+            repository.deleteTrip(tripId)
+            if (_selectedTripId.value == tripId) {
+                _selectedTripId.value = null
+            }
+            showTransientMessage("Ride deleted")
+        }
+    }
+
+    fun dismissCompletedRideSummary() {
+        repository.dismissCompletedRideSummary()
+    }
+
+    fun dismissSosAlert() {
+        _activeSosEvent.value = null
+    }
+
+    fun triggerSimulatedSosAlert(state: Int = BinaryPacketCodec.SOS_STATE_COUNTDOWN) {
+        val lat = _liveTelemetry.value?.latitude ?: selectedDevice.value?.lastLat ?: 21.1458
+        val lon = _liveTelemetry.value?.longitude ?: selectedDevice.value?.lastLon ?: 79.0882
+        repository.triggerSimulatedSosEvent(
+            lat = lat,
+            lon = lon,
+            reason = BinaryPacketCodec.SOS_REASON_CRASH,
+            state = state
+        )
     }
 
     class Factory(private val context: Context) : ViewModelProvider.Factory {

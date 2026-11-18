@@ -64,6 +64,8 @@ import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.safar20.data.local.AppLog
+import com.example.safar20.data.local.EmergencyContact
+import com.example.safar20.data.local.PreferencesDataStore
 import com.example.safar20.data.local.entity.DeviceEntity
 import com.example.safar20.data.network.LinkState
 import com.example.safar20.ui.components.BrassCard
@@ -112,6 +114,12 @@ fun SettingScreen(
     val mqttBrokerUri by viewModel.mqttBrokerUri.collectAsState()
     val mqttUsername by viewModel.mqttUsername.collectAsState()
     val mqttPassword by viewModel.mqttPassword.collectAsState()
+    val emergencyContacts by viewModel.emergencyContacts.collectAsState()
+
+    var c1Name by remember(emergencyContacts) { mutableStateOf(emergencyContacts.getOrNull(0)?.name ?: "") }
+    var c1Phone by remember(emergencyContacts) { mutableStateOf(emergencyContacts.getOrNull(0)?.number ?: "") }
+    var c2Name by remember(emergencyContacts) { mutableStateOf(emergencyContacts.getOrNull(1)?.name ?: "") }
+    var c2Phone by remember(emergencyContacts) { mutableStateOf(emergencyContacts.getOrNull(1)?.number ?: "") }
 
     var hostInput by remember(mqttBrokerUri) { mutableStateOf(mqttBrokerUri) }
     var usernameInput by remember(mqttUsername) { mutableStateOf(mqttUsername) }
@@ -364,6 +372,80 @@ fun SettingScreen(
                         letterSpacing = 1.sp,
                         color = MaterialTheme.colorScheme.primary
                     )
+                }
+            }
+        }
+
+        Spacer(modifier = Modifier.height(20.dp))
+
+        // 3b. EMERGENCY CONTACTS (P3-R5: Up to 2 contacts synced to tracker NVS via 0x07 SET_EMERGENCY)
+        SectionLabel(text = "EMERGENCY CONTACTS")
+        Spacer(modifier = Modifier.height(8.dp))
+        BrassCard(modifier = Modifier.fillMaxWidth()) {
+            Column {
+                Text(
+                    text = "CRASH SOS CONTACTS (0x07)",
+                    fontFamily = Rajdhani,
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 14.sp,
+                    letterSpacing = 1.sp,
+                    color = MaterialTheme.colorScheme.onSurface
+                )
+                Text(
+                    text = "Up to 2 E.164 phone numbers (e.g. +919876543210) stored locally & synced to tracker NVS",
+                    fontFamily = Inter,
+                    fontSize = 11.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Spacer(modifier = Modifier.height(10.dp))
+
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedTextField(
+                        value = c1Name,
+                        onValueChange = { c1Name = it },
+                        label = { Text("Contact 1 Name") },
+                        singleLine = true,
+                        modifier = Modifier.weight(0.45f)
+                    )
+                    OutlinedTextField(
+                        value = c1Phone,
+                        onValueChange = { c1Phone = it },
+                        label = { Text("Phone (+91...)") },
+                        singleLine = true,
+                        isError = !PreferencesDataStore.isValidEmergencyNumber(c1Phone),
+                        modifier = Modifier.weight(0.55f)
+                    )
+                }
+                Spacer(modifier = Modifier.height(8.dp))
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedTextField(
+                        value = c2Name,
+                        onValueChange = { c2Name = it },
+                        label = { Text("Contact 2 Name") },
+                        singleLine = true,
+                        modifier = Modifier.weight(0.45f)
+                    )
+                    OutlinedTextField(
+                        value = c2Phone,
+                        onValueChange = { c2Phone = it },
+                        label = { Text("Phone (+91...)") },
+                        singleLine = true,
+                        isError = !PreferencesDataStore.isValidEmergencyNumber(c2Phone),
+                        modifier = Modifier.weight(0.55f)
+                    )
+                }
+                Spacer(modifier = Modifier.height(12.dp))
+                Button(
+                    onClick = {
+                        viewModel.saveEmergencyContacts(
+                            EmergencyContact(c1Name.trim(), c1Phone.trim()),
+                            EmergencyContact(c2Name.trim(), c2Phone.trim())
+                        )
+                    },
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary)
+                ) {
+                    Text("SAVE & SYNC TO TRACKER", fontFamily = Rajdhani, fontWeight = FontWeight.Bold, fontSize = 12.sp)
                 }
             }
         }
@@ -712,6 +794,22 @@ fun SettingScreen(
                             fontFamily = Rajdhani,
                             fontWeight = FontWeight.Bold,
                             fontSize = 11.sp
+                        )
+                    }
+
+                    Spacer(modifier = Modifier.height(10.dp))
+
+                    OutlinedButton(
+                        onClick = { viewModel.triggerSimulatedSosAlert() },
+                        modifier = Modifier.fillMaxWidth(),
+                        border = BorderStroke(1.dp, SignalRed)
+                    ) {
+                        Text(
+                            text = "SIMULATE CRASH SOS ALERT (0x08)",
+                            fontFamily = Rajdhani,
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 11.sp,
+                            color = SignalRed
                         )
                     }
                 }

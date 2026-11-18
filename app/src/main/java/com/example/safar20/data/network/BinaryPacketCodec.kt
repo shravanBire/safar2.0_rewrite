@@ -19,6 +19,8 @@ object BinaryPacketCodec {
     const val OPCODE_HISTORY_ACK: Byte = 0x04
     const val OPCODE_HEARTBEAT: Byte = 0x05
     const val OPCODE_CLEAR_FLASH: Byte = 0x06
+    const val OPCODE_SET_EMERGENCY: Byte = 0x07
+    const val OPCODE_SOS_EVENT: Byte = 0x08
 
     const val TRIP_POINT_SIZE = 16
     const val OPEN_SESSION_SIZE = 9     // 1B Opcode + 4B LastSyncedTS + 2B Seq + 2B CRC16
@@ -27,6 +29,15 @@ object BinaryPacketCodec {
     const val HISTORY_ACK_SIZE = 7     // 1B Opcode + 2B ChunkID + 1B Status + 1B Reserved + 2B CRC16
     const val HEARTBEAT_SIZE = 9       // 1B Opcode + 4B Timestamp + 2B Seq + 2B CRC16
     const val CLEAR_FLASH_SIZE = 10    // 1B Opcode + 4B UpToTimestamp + 1B Mode + 2B Seq + 2B CRC16
+    const val SET_EMERGENCY_SIZE = 23  // 1B Opcode + 1B Slot + 1B Len + 16B Number + 2B Seq + 2B CRC16 (20B inner)
+    const val SOS_EVENT_SIZE = 23      // 1B Opcode + 16B TripPoint + 1B Reason + 1B State + 2B Seq + 2B CRC16 (20B inner)
+
+    const val SOS_REASON_CRASH = 1
+    const val SOS_REASON_MANUAL = 2
+
+    const val SOS_STATE_COUNTDOWN = 1
+    const val SOS_STATE_CANCELLED = 2
+    const val SOS_STATE_FIRED = 3
 
     data class ParsedTripPoint(
         val timestamp: Long,        // Unix Epoch Seconds (UTC)
@@ -80,6 +91,21 @@ object BinaryPacketCodec {
         val isValidCrc: Boolean
     )
 
+    data class SetEmergencyPacket(
+        val slot: Int,
+        val number: String,
+        val sequenceNumber: Int,
+        val isValidCrc: Boolean
+    )
+
+    data class SosEventPacket(
+        val tripPoint: ParsedTripPoint,
+        val reason: Int,
+        val state: Int,
+        val sequenceNumber: Int,
+        val isValidCrc: Boolean
+    )
+
     /**
      * Extracts inner payload from a plain packet by stripping 1B Opcode (at offset 0)
      * and 2B trailing CRC16 (at the last 2 bytes).
@@ -116,6 +142,8 @@ object BinaryPacketCodec {
             OPCODE_HISTORY_ACK -> HISTORY_ACK_SIZE
             OPCODE_HEARTBEAT -> HEARTBEAT_SIZE
             OPCODE_CLEAR_FLASH -> CLEAR_FLASH_SIZE
+            OPCODE_SET_EMERGENCY -> SET_EMERGENCY_SIZE
+            OPCODE_SOS_EVENT -> SOS_EVENT_SIZE
             else -> 0
         }
     }
@@ -425,6 +453,78 @@ object BinaryPacketCodec {
             upToTimestamp = upToTs,
             mode = mode,
             sequenceNumber = seqNum,
+            isValidCrc = isValidCrc
+        )
+    }
+
+    /**
+     * Encodes 23-byte Set Emergency Packet (0x07):
+     * 1B Opcode | 1B Slot | 1B Len | 16B ASCII zero-padded number | 2B Seq | 2B CRC16
+     */
+    fun encodeSetEmergency(slot: Int, number: String, sequenceNumber: Int = 1): ByteArray {
+        val buffer = ByteBuffer.allocate(SET_EMERGENCY_SIZE).order(ByteOrder.LITTLE_ENDIAN)
+        buffer.put(OPCODE_SET_EMERGENCY)
+        buffer.put((slot and 0xFF).toByte())
+
+        val asciiBytes = number.trim().toByteArray(Charsets.US_ASCII)
+        val len = minOf(asciiBytes.size, 16)
+        buffer.put(len.toByte())
+
+        val numSlot = ByteArray(16)
+        System.arraycopy(asciiBytes, 0, numSlot, 0, len)
+        buffer.put(numSlot)
+        buffer.putShort((sequenceNumber and 0xFFFF).toShort())
+
+        val crc = computeCrc16(buffer.array(), 0, SET_EMERGENCY_SIZE - 2)
+        buffer.putShort(crc.toShort())
+        return buffer.array()
+    }
+
+    /**
+     * Decodes 23-byte Set Emergency Packet (0x07).
+     */
+    fun decodeSetEmergency(data: ByteArray): SetEmergencyPacket? {
+        if (data.size < SET_EMERGENCY_SIZE || data[0] != OPCODE_SET_EMERGENCY) return null
+        val slot = data[1].toInt() and 0xFF
+        val len = (data[2].toInt() and 0xFF).coerceIn(0, 16)
+        val numStr = String(data, 3, len, Charsets.US_ASCII)
+        val seq = ByteBuffer.wrap(data, 19, 2).order(ByteOrder.LITTLE_ENDIAN).short.toInt() and 0xFFFF
+        val isValidCrc = verifyCrc16(data)
+        return SetEmergencyPacket(slot = slot, number = numStr, sequenceNumber = seq, isValidCrc = isValidCrc)
+    }
+
+    /**
+     * Encodes 23-byte SOS Event Packet (0x08):
+     * 1B Opcode | 16B TripPoint | 1B Reason (1=crash, 2=manual) | 1B State (1=countdown, 2=cancelled, 3=fired) | 2B Seq | 2B CRC16
+     */
+    fun encodeSosEvent(point: ParsedTripPoint, reason: Int, state: Int, sequenceNumber: Int = 1): ByteArray {
+        val buffer = ByteBuffer.allocate(SOS_EVENT_SIZE).order(ByteOrder.LITTLE_ENDIAN)
+        buffer.put(OPCODE_SOS_EVENT)
+        buffer.put(encodeTripPoint(point))
+        buffer.put((reason and 0xFF).toByte())
+        buffer.put((state and 0xFF).toByte())
+        buffer.putShort((sequenceNumber and 0xFFFF).toShort())
+
+        val crc = computeCrc16(buffer.array(), 0, SOS_EVENT_SIZE - 2)
+        buffer.putShort(crc.toShort())
+        return buffer.array()
+    }
+
+    /**
+     * Decodes 23-byte SOS Event Packet (0x08).
+     */
+    fun decodeSosEvent(data: ByteArray): SosEventPacket? {
+        if (data.size < SOS_EVENT_SIZE || data[0] != OPCODE_SOS_EVENT) return null
+        val point = decodeTripPoint(data, offset = 1)
+        val reason = data[17].toInt() and 0xFF
+        val state = data[18].toInt() and 0xFF
+        val seq = ByteBuffer.wrap(data, 19, 2).order(ByteOrder.LITTLE_ENDIAN).short.toInt() and 0xFFFF
+        val isValidCrc = verifyCrc16(data)
+        return SosEventPacket(
+            tripPoint = point,
+            reason = reason,
+            state = state,
+            sequenceNumber = seq,
             isValidCrc = isValidCrc
         )
     }

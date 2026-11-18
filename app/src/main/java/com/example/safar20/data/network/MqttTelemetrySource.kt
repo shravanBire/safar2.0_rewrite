@@ -58,6 +58,9 @@ class MqttTelemetrySource(
     private val _statusStream = MutableSharedFlow<BinaryPacketCodec.ParsedTripPoint>(extraBufferCapacity = 64)
     override val statusStream: SharedFlow<BinaryPacketCodec.ParsedTripPoint> = _statusStream.asSharedFlow()
 
+    private val _sosEventStream = MutableSharedFlow<BinaryPacketCodec.SosEventPacket>(extraBufferCapacity = 16)
+    val sosEventStream: SharedFlow<BinaryPacketCodec.SosEventPacket> = _sosEventStream.asSharedFlow()
+
     private val _linkState = MutableStateFlow<LinkState>(LinkState.Idle)
     override val linkState: StateFlow<LinkState> = _linkState.asStateFlow()
 
@@ -83,9 +86,10 @@ class MqttTelemetrySource(
     val histTopic = "safar/v1/$topicDevId/hist"
     val cmdTopic = "safar/v1/$topicDevId/cmd"
     val presenceTopic = "safar/v1/$topicDevId/presence"
+    val eventTopic = "safar/v1/$topicDevId/event"
 
-    private val subTopics = arrayOf(statusTopic, liveTopic, histTopic, presenceTopic)
-    private val subQos = intArrayOf(1, 1, 1, 1)
+    private val subTopics = arrayOf(statusTopic, liveTopic, histTopic, presenceTopic, eventTopic)
+    private val subQos = intArrayOf(1, 1, 1, 1, 1)
 
     // Single sequential consumer channel for incoming MQTT frames (P1-A3)
     private val incomingChannel = Channel<Pair<String, ByteArray>>(Channel.UNLIMITED)
@@ -253,6 +257,15 @@ class MqttTelemetrySource(
         return publishCommand(packet)
     }
 
+    fun sendSetEmergencyCommand(slot: Int, number: String): Boolean {
+        val packet = BinaryPacketCodec.encodeSetEmergency(
+            slot = slot,
+            number = number,
+            sequenceNumber = sequenceNumber++
+        )
+        return publishCommand(packet)
+    }
+
     fun requestHistorySync(): Boolean {
         if (!isConnected) return false
         scope.launch {
@@ -365,6 +378,14 @@ class MqttTelemetrySource(
                         status = ackStatus
                     )
                     publishCommand(ackPacket)
+                }
+            }
+            eventTopic -> {
+                val sosPacket = BinaryPacketCodec.decodeSosEvent(plainData)
+                if (sosPacket != null && sosPacket.isValidCrc) {
+                    lastPacketAcceptedTime = now
+                    _trackerOnline.value = true
+                    _sosEventStream.emit(sosPacket)
                 }
             }
         }

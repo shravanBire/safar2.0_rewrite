@@ -12,6 +12,8 @@ static const uint8_t PKT_HISTORY_CHUNK  = 0x03;
 static const uint8_t PKT_HISTORY_ACK    = 0x04;
 static const uint8_t PKT_HEARTBEAT      = 0x05;
 static const uint8_t PKT_CLEAR_FLASH    = 0x06;
+static const uint8_t PKT_SET_EMERGENCY  = 0x07;
+static const uint8_t PKT_SOS_EVENT      = 0x08;
 
 // Plain packet sizes (including 1B opcode and 2B trailing CRC16)
 static const size_t TRIP_POINT_SIZE     = 16;
@@ -21,6 +23,8 @@ static const size_t HISTORY_CHUNK_SIZE  = 488; // 1B Opcode + 2B ChunkID + 2B To
 static const size_t HISTORY_ACK_SIZE    = 7;   // 1B Opcode + 2B ChunkID + 1B Status + 1B Reserved + 2B CRC16
 static const size_t HEARTBEAT_SIZE      = 9;   // 1B Opcode + 4B Timestamp + 2B Seq + 2B CRC16
 static const size_t CLEAR_FLASH_SIZE    = 10;  // 1B Opcode + 4B UpToTimestamp + 1B Mode + 2B Seq + 2B CRC16
+static const size_t SET_EMERGENCY_SIZE  = 23;  // 1B Opcode + 1B Slot + 1B Len + 16B Number + 2B Seq + 2B CRC16
+static const size_t SOS_EVENT_SIZE      = 23;  // 1B Opcode + 16B TripPoint + 1B Reason + 1B State + 2B Seq + 2B CRC16
 
 // Minimum trusted epoch: 2024-01-01 00:00:00 UTC
 static const uint32_t MIN_TRUSTED_EPOCH = 1704067200UL;
@@ -150,6 +154,23 @@ inline bool verifyPlainCrc16(const uint8_t* plain, size_t plainLen) {
     uint16_t expected = calculateCrc16(plain, plainLen - 2);
     uint16_t received = readU16LE(plain + plainLen - 2);
     return expected == received;
+}
+
+// Encode 23-byte plain SOS Event packet (0x08 — P3-R6)
+inline void encodeSosEventPlain(
+    const TripPoint& pt,
+    uint8_t reason,
+    uint8_t state,
+    uint16_t seqNum,
+    uint8_t out23[SOS_EVENT_SIZE]
+) {
+    out23[0] = PKT_SOS_EVENT;
+    packTripPointLE(pt, out23 + 1);
+    out23[17] = reason;
+    out23[18] = state;
+    writeU16LE(out23 + 19, seqNum);
+    uint16_t crc = calculateCrc16(out23, SOS_EVENT_SIZE - 2);
+    writeU16LE(out23 + SOS_EVENT_SIZE - 2, crc);
 }
 
 // P1-F1 & P1-F2: Command sequence & freshness validation gated on timeTrusted

@@ -2,6 +2,7 @@ package com.example.safar20.data.repository
 
 import android.content.Context
 import com.example.safar20.data.local.AppLog
+import com.example.safar20.data.local.EmergencyContact
 import com.example.safar20.data.local.PreferencesDataStore
 import com.example.safar20.data.local.SafarDatabase
 import com.example.safar20.data.local.TripMath
@@ -49,6 +50,12 @@ class SafarRepository(
     private val _statusStream = MutableSharedFlow<BinaryPacketCodec.ParsedTripPoint>(extraBufferCapacity = 64)
     val statusStream: SharedFlow<BinaryPacketCodec.ParsedTripPoint> = _statusStream.asSharedFlow()
 
+    private val _sosEventStream = MutableSharedFlow<BinaryPacketCodec.SosEventPacket>(extraBufferCapacity = 16)
+    val sosEventStream: SharedFlow<BinaryPacketCodec.SosEventPacket> = _sosEventStream.asSharedFlow()
+
+    private val _completedRideSummary = MutableStateFlow<TripSummaryEntity?>(null)
+    val completedRideSummary: StateFlow<TripSummaryEntity?> = _completedRideSummary.asStateFlow()
+
     private val _linkState = MutableStateFlow<LinkState>(LinkState.Idle)
     val linkState: StateFlow<LinkState> = _linkState.asStateFlow()
 
@@ -63,6 +70,7 @@ class SafarRepository(
     private var statusCollectorJob: Job? = null
     private var linkStateCollectorJob: Job? = null
     private var presenceCollectorJob: Job? = null
+    private var sosCollectorJob: Job? = null
 
     init {
         attachTelemetrySource(activeTelemetrySource)
@@ -87,6 +95,7 @@ class SafarRepository(
         statusCollectorJob?.cancel()
         linkStateCollectorJob?.cancel()
         presenceCollectorJob?.cancel()
+        sosCollectorJob?.cancel()
 
         sourceCollectorJob = repositoryScope.launch {
             source.liveTelemetryStream.collect { point ->
@@ -109,6 +118,12 @@ class SafarRepository(
                     _trackerOnline.value = online
                 }
             }
+            sosCollectorJob = repositoryScope.launch {
+                source.sosEventStream.collect { sosEvent ->
+                    AppLog.i("SOS", "Received SOS_EVENT reason=${sosEvent.reason} state=${sosEvent.state}")
+                    _sosEventStream.emit(sosEvent)
+                }
+            }
         } else {
             _trackerOnline.value = null
         }
@@ -126,6 +141,8 @@ class SafarRepository(
     val mqttPassword: Flow<String> = preferencesDataStore.mqttPassword
     val isDevModeEnabled: Flow<Boolean> = preferencesDataStore.isDevModeEnabled
     val hasCompletedOnboarding: Flow<Boolean> = preferencesDataStore.hasCompletedOnboarding
+    val emergencyContacts: Flow<List<EmergencyContact>> = preferencesDataStore.emergencyContacts
+    val customTripNames: Flow<Map<String, String>> = preferencesDataStore.customTripNames
 
     suspend fun setMqttBrokerConfig(uri: String, username: String, password: String) {
         preferencesDataStore.setMqttBrokerUri(uri)
@@ -139,6 +156,64 @@ class SafarRepository(
 
     suspend fun setHasCompletedOnboarding(completed: Boolean) {
         preferencesDataStore.setHasCompletedOnboarding(completed)
+    }
+
+    suspend fun saveAndSyncEmergencyContacts(contact1: EmergencyContact, contact2: EmergencyContact): Boolean {
+        preferencesDataStore.setEmergencyContacts(contact1, contact2)
+        val source = activeTelemetrySource
+        if (source is MqttTelemetrySource) {
+            val s0 = source.sendSetEmergencyCommand(0, contact1.number)
+            val s1 = source.sendSetEmergencyCommand(1, contact2.number)
+            AppLog.i("Emergency", "Saved emergency contacts (syncedToTracker=${s0 || s1})")
+            return s0 || s1
+        }
+        return false
+    }
+
+    suspend fun renameTrip(tripId: String, newName: String) {
+        preferencesDataStore.setCustomTripName(tripId, newName)
+    }
+
+    suspend fun deleteTrip(tripId: String) {
+        tripDao.deleteTripAndPoints(tripId)
+        preferencesDataStore.removeCustomTripName(tripId)
+        if (_completedRideSummary.value?.tripId == tripId) {
+            _completedRideSummary.value = null
+        }
+    }
+
+    fun dismissCompletedRideSummary() {
+        _completedRideSummary.value = null
+    }
+
+    fun triggerSimulatedSosEvent(
+        lat: Double,
+        lon: Double,
+        reason: Int = BinaryPacketCodec.SOS_REASON_CRASH,
+        state: Int = BinaryPacketCodec.SOS_STATE_COUNTDOWN
+    ) {
+        repositoryScope.launch {
+            val pt = BinaryPacketCodec.ParsedTripPoint(
+                timestamp = System.currentTimeMillis() / 1000,
+                latitude = lat,
+                longitude = lon,
+                speedKmh = 0f,
+                heading = 0,
+                isIgnitionOn = true,
+                isTripStart = false,
+                isTripEnd = false,
+                satCount = 8
+            )
+            _sosEventStream.emit(
+                BinaryPacketCodec.SosEventPacket(
+                    tripPoint = pt,
+                    reason = reason,
+                    state = state,
+                    sequenceNumber = 1,
+                    isValidCrc = true
+                )
+            )
+        }
     }
 
     // --- Trip History Flows ---
@@ -215,20 +290,25 @@ class SafarRepository(
         val now = System.currentTimeMillis() / 1000
         val oneDaySec = 86400L
 
+        val trip1Id = "DEMO_${deviceId}_1"
+        val trip1Start = now - 7200
         val demoTrip1 = TripSummaryEntity(
-            tripId = "DEMO_${deviceId}_1",
+            tripId = trip1Id,
             deviceId = deviceId,
-            startTimestamp = now - 7200,
+            startTimestamp = trip1Start,
             endTimestamp = now - 3600,
             distanceKm = 42.5,
             durationMinutes = 60,
             avgSpeedKmh = 42.5,
             maxSpeedKmh = 88.0
         )
+
+        val trip2Id = "DEMO_${deviceId}_2"
+        val trip2Start = now - oneDaySec - 7200
         val demoTrip2 = TripSummaryEntity(
-            tripId = "DEMO_${deviceId}_2",
+            tripId = trip2Id,
             deviceId = deviceId,
-            startTimestamp = now - oneDaySec - 7200,
+            startTimestamp = trip2Start,
             endTimestamp = now - oneDaySec - 3600,
             distanceKm = 18.4,
             durationMinutes = 35,
@@ -236,8 +316,43 @@ class SafarRepository(
             maxSpeedKmh = 78.0
         )
 
+        val demoPts1 = (0..20).map { idx ->
+            val speed = when (idx) {
+                0, 20 -> 0f
+                10 -> 88f
+                else -> 35f + (idx % 5) * 8f
+            }
+            LocationPointEntity(
+                tripId = trip1Id,
+                deviceId = deviceId,
+                timestamp = trip1Start + idx * 180L,
+                latitude = 21.1458 + idx * 0.0045,
+                longitude = 79.0882 + idx * 0.0052,
+                speedKmh = speed,
+                heading = 45
+            )
+        }
+        val demoPts2 = (0..14).map { idx ->
+            val speed = when (idx) {
+                0, 14 -> 0f
+                7 -> 78f
+                else -> 28f + (idx % 4) * 9f
+            }
+            LocationPointEntity(
+                tripId = trip2Id,
+                deviceId = deviceId,
+                timestamp = trip2Start + idx * 150L,
+                latitude = 21.1458 - idx * 0.0035,
+                longitude = 79.0882 + idx * 0.0040,
+                speedKmh = speed,
+                heading = 135
+            )
+        }
+
+        tripDao.deleteDemoTrips(deviceId)
         tripDao.insertOrUpdateTrip(demoTrip1)
         tripDao.insertOrUpdateTrip(demoTrip2)
+        tripDao.insertTripPoints(demoPts1 + demoPts2)
     }
 
     suspend fun deleteDemoTrips(deviceId: String) {
@@ -362,6 +477,12 @@ class SafarRepository(
                 newLastSyncedTimestamp = committedMaxTs,
                 deviceDao = deviceDao
             )
+            if (chunkPacket.totalChunks <= 0 || chunkPacket.chunkId + 1 >= chunkPacket.totalChunks) {
+                val newestSummary = tripSummariesToUpdate.maxByOrNull { it.endTimestamp }
+                if (newestSummary != null) {
+                    _completedRideSummary.value = newestSummary
+                }
+            }
             AppLog.i("Repo", "Saved history chunk ${chunkPacket.chunkId + 1}/${chunkPacket.totalChunks} (${newPoints.size} pts)")
             true
         } catch (e: Exception) {
@@ -414,11 +535,13 @@ class SafarRepository(
             // P2-U1: If QR v2 carries a valid ssl:// broker, apply broker config automatically.
             // QR v1 (no broker param) preserves existing Settings broker values.
             if (!parsed.brokerUri.isNullOrBlank()) {
-                setMqttBrokerConfig(
-                    uri = parsed.brokerUri,
-                    username = parsed.brokerUsername ?: "",
-                    password = parsed.brokerPassword ?: ""
-                )
+                preferencesDataStore.setMqttBrokerUri(parsed.brokerUri)
+                if (parsed.brokerUsername != null) {
+                    preferencesDataStore.setMqttUsername(parsed.brokerUsername)
+                }
+                if (parsed.brokerPassword != null) {
+                    preferencesDataStore.setMqttPassword(parsed.brokerPassword)
+                }
                 AppLog.i("Pairing", "Applied broker config from QR v${parsed.version} for ${parsed.deviceId}")
             }
 

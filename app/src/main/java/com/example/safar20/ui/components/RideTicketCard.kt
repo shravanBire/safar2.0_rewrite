@@ -119,6 +119,7 @@ class TicketShape(
 @Composable
 fun RideTicketCard(
     trip: TripSummaryEntity,
+    customName: String? = null,
     speedUnit: String = "km/h",
     isSelected: Boolean = false,
     routePoints: List<LocationPointEntity> = emptyList(),
@@ -131,6 +132,7 @@ fun RideTicketCard(
 
     val formattedTimeRange = formatTimeRange(trip.startTimestamp, trip.endTimestamp)
     val rideNumber = trip.tripId.takeLast(2).uppercase()
+    val rideTitle = customName?.takeIf { it.isNotBlank() }?.uppercase() ?: "RIDE #$rideNumber"
 
     val mapLat = routePoints.firstOrNull()?.latitude ?: 21.1458
     val mapLon = routePoints.firstOrNull()?.longitude ?: 79.0882
@@ -162,7 +164,7 @@ fun RideTicketCard(
             ) {
                 Column {
                     Text(
-                        text = "RIDE #$rideNumber",
+                        text = rideTitle,
                         fontFamily = BebasNeue,
                         fontSize = 20.sp,
                         color = MaterialTheme.colorScheme.primary,

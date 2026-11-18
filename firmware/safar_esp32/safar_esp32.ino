@@ -20,6 +20,7 @@
 #include <TinyGPSPlus.h>
 #include <MPU6050_light.h>
 #include <LittleFS.h>
+#include <Preferences.h>
 #include <time.h>
 #include "safar_types.h"
 #include "safar_crypto.h"
@@ -96,9 +97,18 @@ static char     topicStatus[48]   = {0};
 static char     topicLive[48]     = {0};
 static char     topicHist[48]     = {0};
 static char     topicCmd[48]      = {0};
+static char     topicEvent[48]    = {0};
 static char     topicPresence[48] = {0};
 
+static Preferences nvsPrefs;
+static char     emergencySlot0[17] = {0};
+static char     emergencySlot1[17] = {0};
+
 static uint16_t liveSeqNum        = 1;
+static uint16_t sosSeqNum         = 1;
+static bool     sosCountdownActive = false;
+static uint8_t  sosReason         = 0;
+static uint32_t sosStartMs        = 0;
 static uint32_t lastTelemetryMs   = 0;
 static uint32_t lastWifiRetryMs   = 0;
 static uint32_t lastMqttRetryMs   = 0;
@@ -329,6 +339,27 @@ bool handleIncomingCommandFrame(const uint8_t* frame, size_t frameLen) {
         clearFlashHistory();
         return true;
     }
+    if (opcode == PKT_SET_EMERGENCY && plainLen == SET_EMERGENCY_SIZE) {
+        uint8_t  slot   = plain[1];
+        uint8_t  numLen = plain[2];
+        uint16_t seqNum = readU16LE(plain + 19);
+        if (timeTrusted && !isSeqNewer(seqNum, cmdReplayState)) {
+            return false;
+        }
+        if (slot <= 1 && numLen <= 16) {
+            char numBuf[17] = {0};
+            memcpy(numBuf, plain + 3, numLen);
+            numBuf[numLen] = '\0';
+            if (slot == 0) {
+                strncpy(emergencySlot0, numBuf, sizeof(emergencySlot0) - 1);
+                nvsPrefs.putString("emg0", emergencySlot0);
+            } else {
+                strncpy(emergencySlot1, numBuf, sizeof(emergencySlot1) - 1);
+                nvsPrefs.putString("emg1", emergencySlot1);
+            }
+        }
+        return true;
+    }
     return false;
 }
 
@@ -383,6 +414,30 @@ bool buildCurrentTripPoint(TripPoint& outPt, bool& outIsRealGps) {
 #else
     return false;
 #endif
+}
+
+void publishSosEvent(uint8_t reason, uint8_t state) {
+    TripPoint pt;
+    bool isReal = false;
+    if (!buildCurrentTripPoint(pt, isReal)) {
+        pt.timestamp     = getCurrentEpochSeconds();
+        pt.lat_e7        = FALLBACK_LAT_E7;
+        pt.lon_e7        = FALLBACK_LON_E7;
+        pt.speed_decideg = 0;
+        pt.heading_div2  = 0;
+        pt.flags         = 0;
+    }
+    uint8_t plain23[SOS_EVENT_SIZE];
+    encodeSosEventPlain(pt, reason, state, sosSeqNum++, plain23);
+    publishEncryptedPacket(topicEvent, plain23, SOS_EVENT_SIZE, false);
+}
+
+void startSosCountdown(uint8_t reason) {
+    if (sosCountdownActive) return;
+    sosCountdownActive = true;
+    sosReason          = reason;
+    sosStartMs         = millis();
+    publishSosEvent(reason, 0); // state=0: 15s countdown started
 }
 
 // ============================================================================
@@ -475,10 +530,16 @@ void setup() {
     snprintf(topicLive,     sizeof(topicLive),     "safar/v1/%s/live",     topicId);
     snprintf(topicHist,     sizeof(topicHist),     "safar/v1/%s/hist",     topicId);
     snprintf(topicCmd,      sizeof(topicCmd),      "safar/v1/%s/cmd",      topicId);
+    snprintf(topicEvent,    sizeof(topicEvent),    "safar/v1/%s/event",    topicId);
     snprintf(topicPresence, sizeof(topicPresence), "safar/v1/%s/presence", topicId);
 
-    // 2. Mount LittleFS for offline trip logging
+    // 2. Mount LittleFS & NVS Preferences
     fsMounted = LittleFS.begin(true);
+    nvsPrefs.begin("safar", false);
+    String s0 = nvsPrefs.getString("emg0", "");
+    String s1 = nvsPrefs.getString("emg1", "");
+    strncpy(emergencySlot0, s0.c_str(), sizeof(emergencySlot0) - 1);
+    strncpy(emergencySlot1, s1.c_str(), sizeof(emergencySlot1) - 1);
 
     // 3. Init GPS UART1 (RX=16, TX=17) & MPU6050 I2C (SDA=21, SCL=22)
     gpsSerial.begin(9600, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
@@ -565,6 +626,17 @@ void loop() {
         }
     }
 
+    // 6. Crash / SOS Countdown state machine (P3-R6)
+    if (sosCountdownActive) {
+        if (digitalRead(SOS_CANCEL_PIN) == LOW) {
+            sosCountdownActive = false;
+            publishSosEvent(sosReason, 1); // state=1: Cancelled by rider
+        } else if (now - sosStartMs >= 15000UL) {
+            sosCountdownActive = false;
+            publishSosEvent(sosReason, 2); // state=2: SOS fired after 15s
+        }
+    }
+
 #if RELEASE_BUILD == 0
     if (Serial.available() > 0) {
         char ch = static_cast<char>(Serial.read());
@@ -574,6 +646,9 @@ void loop() {
         } else if (ch == 'f') {
             Serial.println("[DEV] Clearing LittleFS flash log");
             clearFlashHistory();
+        } else if (ch == 'c') {
+            Serial.println("[DEV] Triggering Crash SOS countdown (0x08)");
+            startSosCountdown(0);
         }
     }
 #endif

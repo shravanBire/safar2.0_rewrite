@@ -22,9 +22,12 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Compress
 import androidx.compose.material.icons.filled.Expand
+import androidx.compose.material.icons.filled.Navigation
 import androidx.compose.material.icons.filled.QrCodeScanner
+import androidx.compose.material.icons.filled.Share
 import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material.icons.filled.WifiOff
 import androidx.compose.material3.Button
@@ -32,6 +35,7 @@ import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Text
@@ -48,9 +52,11 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.example.safar20.data.local.RideExportAndNav
 import com.example.safar20.data.local.UnitConverter
 import com.example.safar20.ui.components.BrassCard
 import com.example.safar20.ui.components.BrassStatBadge
@@ -82,6 +88,7 @@ fun HomeScreen(
     onOpenAdvancedSettings: () -> Unit = {},
     modifier: Modifier = Modifier
 ) {
+    val context = LocalContext.current
     val selectedDevice by viewModel.selectedDevice.collectAsState()
     val allDevices by viewModel.allDevices.collectAsState()
     val hasLiveData by viewModel.hasLiveData.collectAsState()
@@ -97,6 +104,7 @@ fun HomeScreen(
     val trackerOnline by viewModel.trackerOnline.collectAsState()
     val isNetworkAvailable by viewModel.isNetworkAvailable.collectAsState()
     val speedUnit by viewModel.speedUnit.collectAsState()
+    val completedRideSummary by viewModel.completedRideSummary.collectAsState()
 
     var showDeviceMenu by remember { mutableStateOf(false) }
     var showQrDialog by remember { mutableStateOf(false) }
@@ -150,7 +158,18 @@ fun HomeScreen(
             BannerAction.RETRY_CONNECTION -> {
                 viewModel.retryConnection()
             }
-            BannerAction.NAVIGATE_TO_BIKE, null -> {}
+            BannerAction.NAVIGATE_TO_BIKE -> {
+                if (realOrSavedLat != null && realOrSavedLon != null) {
+                    val launched = RideExportAndNav.navigateToBike(
+                        context = context,
+                        lat = realOrSavedLat,
+                        lon = realOrSavedLon,
+                        label = selectedDevice?.deviceName ?: "Bike"
+                    )
+                    if (!launched) viewModel.showTransientMessage("No map app installed")
+                }
+            }
+            null -> {}
         }
     }
 
@@ -263,6 +282,44 @@ fun HomeScreen(
                                     }
                                 }
                             }
+                        }
+                    }
+                }
+            }
+
+            // 1c. Ride-Complete Summary Card (P3-R7)
+            if (completedRideSummary != null) {
+                val summary = completedRideSummary!!
+                val distStr = UnitConverter.formatDistance(summary.distanceKm, speedUnit, 1)
+                val maxStr = UnitConverter.formatSpeed(summary.maxSpeedKmh, speedUnit, 0)
+                BrassCard(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 16.dp, vertical = 6.dp)
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            text = "Ride complete · $distStr · max $maxStr",
+                            fontFamily = Rajdhani,
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 14.sp,
+                            color = PhosphorGreen,
+                            modifier = Modifier.weight(1f)
+                        )
+                        IconButton(
+                            onClick = { viewModel.dismissCompletedRideSummary() },
+                            modifier = Modifier.size(24.dp)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Close,
+                                contentDescription = "Dismiss",
+                                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.size(16.dp)
+                            )
                         }
                     }
                 }
@@ -454,6 +511,51 @@ fun HomeScreen(
                             fontSize = 10.sp,
                             letterSpacing = 1.sp
                         )
+                    }
+                }
+            }
+
+            // 5. Navigate to Bike & Share Bike Location (P3-R4 — only when real/saved coordinates exist)
+            if (realOrSavedLat != null && realOrSavedLon != null) {
+                Spacer(modifier = Modifier.height(10.dp))
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 16.dp),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    OutlinedButton(
+                        onClick = {
+                            val ok = RideExportAndNav.navigateToBike(
+                                context = context,
+                                lat = realOrSavedLat,
+                                lon = realOrSavedLon,
+                                label = selectedDevice?.deviceName ?: "Bike"
+                            )
+                            if (!ok) viewModel.showTransientMessage("No map app found")
+                        },
+                        modifier = Modifier.weight(1f),
+                        shape = RoundedCornerShape(12.dp)
+                    ) {
+                        Icon(Icons.Default.Navigation, contentDescription = null, modifier = Modifier.size(15.dp))
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text("NAVIGATE TO BIKE", fontFamily = Rajdhani, fontWeight = FontWeight.Bold, fontSize = 11.sp)
+                    }
+                    OutlinedButton(
+                        onClick = {
+                            RideExportAndNav.shareBikeLocation(
+                                context = context,
+                                lat = realOrSavedLat,
+                                lon = realOrSavedLon,
+                                bikeName = selectedDevice?.deviceName ?: "My Bike"
+                            )
+                        },
+                        modifier = Modifier.weight(1f),
+                        shape = RoundedCornerShape(12.dp)
+                    ) {
+                        Icon(Icons.Default.Share, contentDescription = null, modifier = Modifier.size(15.dp))
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text("SHARE LOCATION", fontFamily = Rajdhani, fontWeight = FontWeight.Bold, fontSize = 11.sp)
                     }
                 }
             }

@@ -148,11 +148,15 @@ sealed class NavItem(val route: String, val title: String, val icon: ImageVector
     object Settings : NavItem("settings", "Settings", Icons.Default.Settings)
 }
 
+@androidx.annotation.OptIn(androidx.camera.core.ExperimentalGetImage::class)
 @Composable
 fun SafarAppContent(safarViewModel: SafarViewModel) {
     val isDarkTheme by safarViewModel.isDarkTheme.collectAsState()
     val hasCompletedOnboarding by safarViewModel.hasCompletedOnboarding.collectAsState()
     val allDevices by safarViewModel.allDevices.collectAsState()
+    val selectedDevice by safarViewModel.selectedDevice.collectAsState()
+    val emergencyContacts by safarViewModel.emergencyContacts.collectAsState()
+    val activeSosEvent by safarViewModel.activeSosEvent.collectAsState()
     val transientMessage by safarViewModel.transientMessage.collectAsState()
 
     var selectedScreenIndex by remember { mutableIntStateOf(0) }
@@ -268,6 +272,16 @@ fun SafarAppContent(safarViewModel: SafarViewModel) {
                         selectedScreenIndex = 0
                         openPairingOnHome = true
                     }
+                )
+            }
+
+            val currentSos = activeSosEvent
+            if (currentSos != null) {
+                com.example.safar20.ui.components.SosAlertOverlay(
+                    sosEvent = currentSos,
+                    trackerName = selectedDevice?.deviceName ?: "Tracker",
+                    emergencyContacts = emergencyContacts,
+                    onDismiss = { safarViewModel.dismissSosAlert() }
                 )
             }
         }
