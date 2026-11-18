@@ -6,10 +6,19 @@
  *   - TinyGPSPlus  (by Mikal Hart)
  *   - MPU6050_light (by rfetick)
  *
- * Phase 1 Hardened:
- *   - P1-F1: Explicit bool timeTrusted (true only after real GPS time or NTP; false on millis fallback)
- *   - P1-F2: Freshness/replay checks enforced when timeTrusted == true (HEARTBEAT ±600s, CLEAR_FLASH ±120s, seq > cmdSeq)
- *   - P1-F3: Single RELEASE_BUILD flag (0 = dev/bench defaults, 1 = production CA verify & no fallback coords)
+ * PHASE F-A Hardened:
+ *   1. timeTrusted: true ONLY via real GPS date/time or NTP (> 1700000000).
+ *      Phone-time bootstrap from HEARTBEAT and fallback (1762800000 + millis()/1000) never set timeTrusted.
+ *   2. isRealGps requires timeTrusted; flash logging strictly gated on isRealGps.
+ *      Logs "[TIME] trusted via GPS|NTP" once, and "[TIME] untrusted - not logging" every 30s when GPS has fix.
+ *   3. Command authenticity (HEARTBEAT, CLEAR_FLASH, SET_EMERGENCY) with OPEN_SESSION sequence reset.
+ *      Logs "[CMD] rejected <name>: stale|replay|untrusted-time".
+ *   4. RELEASE_BUILD flag forcing VERIFY_TLS=1, STREAM_ON_BOOT=0, DEMO_FAKE_GPS=0, INDOOR_TABLE_FALLBACK=0, ALLOW_REMOTE_CLEAR=0.
+ *      Refuses MQTT if VERIFY_TLS==1 and CA PEM contains "PASTE_YOUR" ("[TLS] CA certificate missing" every 10s).
+ *      Prints "[CFG] release=.. tls=.. demo=.. indoor=.." at boot.
+ *   5. startSync(lastTs) future cursor check (> epoch + 86400 -> use 0, "[SYNC] app cursor is in the future, ignoring")
+ *      and never erases /trips.bin when !timeTrusted.
+ *   6. History ACK timeout = 10000 ms with max 3 retries (stop-and-wait).
  */
 
 #include <Arduino.h>
@@ -37,24 +46,34 @@
 #include "secrets.h.example"
 #endif
 
+#ifndef EMQX_CA_PEM
+#define EMQX_CA_PEM SAFAR_MQTT_ROOT_CA_PEM
+#endif
+
 // ============================================================================
-// P1-F3: BUILD MODE & FEATURE FLAGS
-// Set RELEASE_BUILD to 1 for production motorcycles, 0 for bench/car testing
+// PHASE F-A Task 4: RELEASE_BUILD & FEATURE FLAGS
 // ============================================================================
 #ifndef RELEASE_BUILD
 #define RELEASE_BUILD 0
 #endif
 
+#define VERIFY_TLS            0
+#define STREAM_ON_BOOT        1
+#define DEMO_FAKE_GPS         0
+#define INDOOR_TABLE_FALLBACK 1
+#define ALLOW_REMOTE_CLEAR    1
+
 #if RELEASE_BUILD == 1
+  #undef VERIFY_TLS
   #define VERIFY_TLS            1
+  #undef STREAM_ON_BOOT
   #define STREAM_ON_BOOT        0
+  #undef DEMO_FAKE_GPS
   #define DEMO_FAKE_GPS         0
+  #undef INDOOR_TABLE_FALLBACK
   #define INDOOR_TABLE_FALLBACK 0
-#else
-  #define VERIFY_TLS            0
-  #define STREAM_ON_BOOT        1
-  #define DEMO_FAKE_GPS         0
-  #define INDOOR_TABLE_FALLBACK 1
+  #undef ALLOW_REMOTE_CLEAR
+  #define ALLOW_REMOTE_CLEAR    0
 #endif
 
 // ============================================================================
@@ -85,10 +104,14 @@ static bool     mpuConnected      = false;
 static bool     fsMounted         = false;
 static float    refAx = 0.0f, refAy = 0.0f, refAz = 1.0f;
 
-// P1-F1: Time trust state
-static bool     timeTrusted       = false;
-static uint32_t trustedBaseEpoch  = 0;
-static uint32_t trustedBaseMs     = 0;
+// PHASE F-A Task 1 & 2: Time trust state
+static bool     timeTrusted             = false;
+static uint32_t trustedBaseEpoch        = 0;
+static uint32_t trustedBaseMs           = 0;
+static uint32_t phoneBootstrapEpoch     = 0; // Display-only, NEVER sets timeTrusted
+static uint32_t phoneBootstrapMs        = 0;
+static uint32_t lastUntrustedTimeLogMs  = 0;
+static uint32_t lastCaMissingLogMs      = 0;
 
 // Crypto & MQTT topics
 static uint8_t  sharedKey32[32]   = {0};
@@ -120,29 +143,34 @@ static bool     tripStartPending  = true;
 static uint32_t lastMovingMs      = 0;
 static CommandReplayState cmdReplayState;
 
-static bool     syncActive        = false;
+static bool     syncActive         = false;
 static bool     waitingForChunkAck = false;
-static uint16_t currentChunkId    = 0;
-static uint16_t totalSyncChunks   = 0;
+static uint16_t currentChunkId     = 0;
+static uint16_t totalSyncChunks    = 0;
 static uint32_t syncRequestedSinceTs = 0;
-static uint32_t lastChunkSentMs   = 0;
+static uint32_t lastChunkSentMs    = 0;
+static uint8_t  chunkRetryCount    = 0;
 
 // ============================================================================
-// TIME TRUST MANAGEMENT (P1-F1)
+// PHASE F-A Task 1 & 2: TIME TRUST MANAGEMENT
 // ============================================================================
-void updateEpochFromGpsOrNtp(uint32_t utcEpochSeconds) {
-    if (utcEpochSeconds >= MIN_TRUSTED_EPOCH) {
+void markTimeTrusted(uint32_t utcEpochSeconds, const char* sourceLabel) {
+    if (utcEpochSeconds > MIN_TRUSTED_EPOCH) {
+        bool wasTrusted  = timeTrusted;
         trustedBaseEpoch = utcEpochSeconds;
         trustedBaseMs    = millis();
         timeTrusted      = true;
+        if (!wasTrusted) {
+            Serial.printf("[TIME] trusted via %s\n", sourceLabel);
+        }
     }
 }
 
 void checkNtpTimeTrust() {
     if (timeTrusted) return;
     time_t nowSec = time(nullptr);
-    if (nowSec >= static_cast<time_t>(MIN_TRUSTED_EPOCH)) {
-        updateEpochFromGpsOrNtp(static_cast<uint32_t>(nowSec));
+    if (nowSec > static_cast<time_t>(MIN_TRUSTED_EPOCH)) {
+        markTimeTrusted(static_cast<uint32_t>(nowSec), "NTP");
     }
 }
 
@@ -156,8 +184,8 @@ void checkGpsTimeTrust() {
         t.tm_min  = gps.time.minute();
         t.tm_sec  = gps.time.second();
         time_t epoch = mktime(&t);
-        if (epoch >= static_cast<time_t>(MIN_TRUSTED_EPOCH)) {
-            updateEpochFromGpsOrNtp(static_cast<uint32_t>(epoch));
+        if (epoch > static_cast<time_t>(MIN_TRUSTED_EPOCH)) {
+            markTimeTrusted(static_cast<uint32_t>(epoch), "GPS");
         }
     }
 }
@@ -165,12 +193,15 @@ void checkGpsTimeTrust() {
 uint32_t getCurrentEpochSeconds() {
     checkGpsTimeTrust();
     checkNtpTimeTrust();
-    if (timeTrusted && trustedBaseEpoch >= MIN_TRUSTED_EPOCH) {
+    if (timeTrusted && trustedBaseEpoch > MIN_TRUSTED_EPOCH) {
         return trustedBaseEpoch + ((millis() - trustedBaseMs) / 1000UL);
     }
-    timeTrusted = false;
-    // Untrusted display-only fallback (never logged to flash when timeTrusted == false)
-    return 1700000000UL + (millis() / 1000UL);
+    // Display-only phone bootstrap from HEARTBEAT (NEVER sets timeTrusted)
+    if (phoneBootstrapEpoch > MIN_TRUSTED_EPOCH) {
+        return phoneBootstrapEpoch + ((millis() - phoneBootstrapMs) / 1000UL);
+    }
+    // Display-only fallback epoch (NEVER sets timeTrusted)
+    return UNTRUSTED_FALLBACK_BASE + (millis() / 1000UL);
 }
 
 // ============================================================================
@@ -196,11 +227,11 @@ bool publishEncryptedPacket(const char* topic, const uint8_t* plainPacket, size_
 }
 
 // ============================================================================
-// LITTLEFS FLASH LOGGING & HISTORY CHUNK SYNC
+// LITTLEFS FLASH LOGGING & HISTORY CHUNK SYNC (PHASE F-A Tasks 2, 5, 6)
 // ============================================================================
-void appendPointToFlash(const TripPoint& pt) {
-    // P1-F1: Never log to flash unless timeTrusted is true and GPS fix is real
-    if (!fsMounted || !timeTrusted) return;
+void appendPointToFlash(const TripPoint& pt, bool isRealGps) {
+    // PHASE F-A Task 2: Nothing is written to flash unless isRealGps (which requires timeTrusted)
+    if (!fsMounted || !timeTrusted || !isRealGps) return;
     File f = LittleFS.open(FLASH_LOG_PATH, FILE_APPEND);
     if (!f) return;
     uint8_t raw16[TRIP_POINT_SIZE];
@@ -225,20 +256,42 @@ size_t countFlashPointsSince(uint32_t sinceTs) {
     return count;
 }
 
-void startHistorySync(uint32_t sinceTs) {
-    syncRequestedSinceTs = sinceTs;
-    size_t matchingPoints = countFlashPointsSince(sinceTs);
+void clearFlashHistory() {
+    if (fsMounted && LittleFS.exists(FLASH_LOG_PATH)) {
+        LittleFS.remove(FLASH_LOG_PATH);
+    }
+    syncActive = false;
+    waitingForChunkAck = false;
+    chunkRetryCount = 0;
+}
+
+void startSync(uint32_t lastTs) {
+    uint32_t nowEpoch = getCurrentEpochSeconds();
+    // PHASE F-A Task 5: If timeTrusted and lastTs > epoch + 86400, ignore the app's lastTs (use 0)
+    if (timeTrusted && lastTs > (nowEpoch + FUTURE_CURSOR_MAX_DRIFT_S)) {
+        Serial.println("[SYNC] app cursor is in the future, ignoring");
+        lastTs = 0;
+    }
+
+    syncRequestedSinceTs = lastTs;
+    size_t matchingPoints = countFlashPointsSince(lastTs);
     if (matchingPoints == 0) {
         // Send 1 empty completion chunk (totalChunks=1, count=0) so app knows sync is up-to-date
         uint8_t plainChunk[HISTORY_CHUNK_SIZE];
         encodeHistoryChunkPlain(1, 1, 0, nullptr, plainChunk);
         publishEncryptedPacket(topicHist, plainChunk, HISTORY_CHUNK_SIZE, false);
+        // PHASE F-A Task 5: If !timeTrusted, never erase /trips.bin in the "nothing new" branch
+        if (timeTrusted && lastTs > 0) {
+            clearFlashHistory();
+        }
         syncActive = false;
         waitingForChunkAck = false;
+        chunkRetryCount = 0;
         return;
     }
     totalSyncChunks = static_cast<uint16_t>((matchingPoints + 29) / 30);
     currentChunkId = 1;
+    chunkRetryCount = 0;
     syncActive = true;
     waitingForChunkAck = false;
 }
@@ -277,21 +330,13 @@ void sendCurrentHistoryChunk() {
     }
 }
 
-void clearFlashHistory() {
-    if (fsMounted && LittleFS.exists(FLASH_LOG_PATH)) {
-        LittleFS.remove(FLASH_LOG_PATH);
-    }
-    syncActive = false;
-    waitingForChunkAck = false;
-}
-
 // ============================================================================
-// INCOMING COMMAND HANDLER (safar/v1/<topic_id>/cmd)
+// INCOMING COMMAND HANDLER (safar/v1/<topic_id>/cmd) — PHASE F-A Task 3
 // ============================================================================
 bool handleIncomingCommandFrame(const uint8_t* frame, size_t frameLen) {
     if (frameLen < 33 || frameLen > 128) return false;
 
-    uint8_t plain[128];
+    uint8_t plain[64];
     size_t plainLen = SafarCrypto::decryptToPlainPacket(sharedKey32, frame, frameLen, plain);
     if (plainLen < 7 || !verifyPlainCrc16(plain, plainLen)) {
         return false;
@@ -303,8 +348,9 @@ bool handleIncomingCommandFrame(const uint8_t* frame, size_t frameLen) {
     if (opcode == PKT_OPEN_SESSION && plainLen == OPEN_SESSION_SIZE) {
         uint32_t lastSyncedTs = readU32LE(plain + 1);
         uint16_t seqNum       = readU16LE(plain + 5);
-        (void)seqNum;
-        startHistorySync(lastSyncedTs);
+        // PHASE F-A Task 3: OPEN_SESSION resets cmdSeq/cmdSeqValid from its own seq
+        resetCmdSeqOnOpenSession(seqNum, cmdReplayState);
+        startSync(lastSyncedTs);
         return true;
     }
     if (opcode == PKT_HISTORY_ACK && plainLen == HISTORY_ACK_SIZE) {
@@ -312,8 +358,13 @@ bool handleIncomingCommandFrame(const uint8_t* frame, size_t frameLen) {
         uint8_t  status     = plain[3];
         if (syncActive && waitingForChunkAck && ackChunkId == currentChunkId && status == 0) {
             waitingForChunkAck = false;
+            chunkRetryCount = 0;
             if (currentChunkId >= totalSyncChunks) {
-                clearFlashHistory();
+                if (timeTrusted) {
+                    clearFlashHistory();
+                } else {
+                    syncActive = false;
+                }
             } else {
                 currentChunkId++;
             }
@@ -323,8 +374,17 @@ bool handleIncomingCommandFrame(const uint8_t* frame, size_t frameLen) {
     if (opcode == PKT_HEARTBEAT && plainLen == HEARTBEAT_SIZE) {
         uint32_t hbTs   = readU32LE(plain + 1);
         uint16_t seqNum = readU16LE(plain + 5);
-        if (!verifyCommandFreshnessAndSeq(PKT_HEARTBEAT, hbTs, seqNum, timeTrusted, nowEpoch, cmdReplayState)) {
+        CommandRejectReason rej = validateAuthenticatedCommand(
+            PKT_HEARTBEAT, hbTs, seqNum, timeTrusted, (ALLOW_REMOTE_CLEAR == 1), nowEpoch, cmdReplayState
+        );
+        if (rej != CMD_ACCEPT) {
+            Serial.printf("[CMD] rejected HEARTBEAT: %s\n", rejectReasonToString(rej));
             return false;
+        }
+        // Display-only phone bootstrap when !timeTrusted (NEVER sets timeTrusted)
+        if (!timeTrusted && hbTs > MIN_TRUSTED_EPOCH) {
+            phoneBootstrapEpoch = hbTs;
+            phoneBootstrapMs    = millis();
         }
         return true;
     }
@@ -333,7 +393,11 @@ bool handleIncomingCommandFrame(const uint8_t* frame, size_t frameLen) {
         uint8_t  mode   = plain[5];
         uint16_t seqNum = readU16LE(plain + 6);
         (void)mode;
-        if (!verifyCommandFreshnessAndSeq(PKT_CLEAR_FLASH, upToTs, seqNum, timeTrusted, nowEpoch, cmdReplayState)) {
+        CommandRejectReason rej = validateAuthenticatedCommand(
+            PKT_CLEAR_FLASH, upToTs, seqNum, timeTrusted, (ALLOW_REMOTE_CLEAR == 1), nowEpoch, cmdReplayState
+        );
+        if (rej != CMD_ACCEPT) {
+            Serial.printf("[CMD] rejected CLEAR_FLASH: %s\n", rejectReasonToString(rej));
             return false;
         }
         clearFlashHistory();
@@ -343,7 +407,11 @@ bool handleIncomingCommandFrame(const uint8_t* frame, size_t frameLen) {
         uint8_t  slot   = plain[1];
         uint8_t  numLen = plain[2];
         uint16_t seqNum = readU16LE(plain + 19);
-        if (timeTrusted && !isSeqNewer(seqNum, cmdReplayState)) {
+        CommandRejectReason rej = validateAuthenticatedCommand(
+            PKT_SET_EMERGENCY, nowEpoch, seqNum, timeTrusted, (ALLOW_REMOTE_CLEAR == 1), nowEpoch, cmdReplayState
+        );
+        if (rej != CMD_ACCEPT) {
+            Serial.printf("[CMD] rejected SET_EMERGENCY: %s\n", rejectReasonToString(rej));
             return false;
         }
         if (slot <= 1 && numLen <= 16) {
@@ -370,14 +438,22 @@ void onMqttMessage(char* topic, byte* payload, unsigned int length) {
 }
 
 // ============================================================================
-// TELEMETRY BUILDER & PUBLISHER
+// TELEMETRY BUILDER & PUBLISHER (PHASE F-A Task 2)
 // ============================================================================
 bool buildCurrentTripPoint(TripPoint& outPt, bool& outIsRealGps) {
     uint32_t nowEpoch = getCurrentEpochSeconds();
     bool hasGpsFix = gps.location.isValid() && gps.location.age() < 5000 && gps.satellites.value() > 0;
 
-    // P1-F1: isRealGps requires both a valid GPS fix and timeTrusted == true
+    // PHASE F-A Task 2: isRealGps requires both a valid GPS fix and timeTrusted == true
     outIsRealGps = hasGpsFix && timeTrusted;
+
+    if (hasGpsFix && !timeTrusted) {
+        uint32_t nowMs = millis();
+        if (lastUntrustedTimeLogMs == 0 || (nowMs - lastUntrustedTimeLogMs) >= 30000UL) {
+            lastUntrustedTimeLogMs = nowMs;
+            Serial.println("[TIME] untrusted - not logging");
+        }
+    }
 
     if (hasGpsFix) {
         outPt.timestamp     = nowEpoch;
@@ -403,13 +479,12 @@ bool buildCurrentTripPoint(TripPoint& outPt, bool& outIsRealGps) {
     }
 
 #if INDOOR_TABLE_FALLBACK == 1
-    // Bench/indoor fallback: satCount = 0 so app displays "LIVE · NO GPS FIX" (P1-A8) and never logs to flash (P1-F1)
     outPt.timestamp     = nowEpoch;
     outPt.lat_e7        = FALLBACK_LAT_E7;
     outPt.lon_e7        = FALLBACK_LON_E7;
     outPt.speed_decideg = 0;
     outPt.heading_div2  = 0;
-    outPt.flags         = packFlags(true, false, false, 0); // satCount == 0!
+    outPt.flags         = packFlags(true, false, false, 0); // satCount == 0
     return true;
 #else
     return false;
@@ -421,8 +496,8 @@ void publishSosEvent(uint8_t reason, uint8_t state) {
     bool isReal = false;
     if (!buildCurrentTripPoint(pt, isReal)) {
         pt.timestamp     = getCurrentEpochSeconds();
-        pt.lat_e7        = FALLBACK_LAT_E7;
-        pt.lon_e7        = FALLBACK_LON_E7;
+        pt.lat_e7        = 0;
+        pt.lon_e7        = 0;
         pt.speed_decideg = 0;
         pt.heading_div2  = 0;
         pt.flags         = 0;
@@ -437,20 +512,17 @@ void startSosCountdown(uint8_t reason) {
     sosCountdownActive = true;
     sosReason          = reason;
     sosStartMs         = millis();
-    publishSosEvent(reason, 0); // state=0: 15s countdown started
+    publishSosEvent(reason, 1); // state=1: countdown started
 }
 
 // ============================================================================
-// WI-FI & MQTT CONNECTION MANAGEMENT
+// WI-FI & MQTT CONNECTION MANAGEMENT (PHASE F-A Task 4)
 // ============================================================================
 void ensureWifiConnected() {
     if (WiFi.status() == WL_CONNECTED) return;
     uint32_t now = millis();
     if (lastWifiRetryMs == 0 || (now - lastWifiRetryMs) >= 10000UL) {
         lastWifiRetryMs = now;
-#if RELEASE_BUILD == 0
-        Serial.printf("[Wi-Fi] Connecting to SSID: %s ...\n", WIFI_SSID);
-#endif
         WiFi.mode(WIFI_STA);
         WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
     }
@@ -459,6 +531,17 @@ void ensureWifiConnected() {
 void ensureMqttConnected() {
     if (WiFi.status() != WL_CONNECTED) return;
     checkNtpTimeTrust();
+
+#if VERIFY_TLS == 1
+    if (strstr(EMQX_CA_PEM, "PASTE_YOUR") != nullptr) {
+        uint32_t nowMs = millis();
+        if (lastCaMissingLogMs == 0 || (nowMs - lastCaMissingLogMs) >= 10000UL) {
+            lastCaMissingLogMs = nowMs;
+            Serial.println("[TLS] CA certificate missing");
+        }
+        return;
+    }
+#endif
 
     if (mqtt.connected()) return;
     uint32_t now = millis();
@@ -494,7 +577,6 @@ void ensureMqttConnected() {
         mqtt.publish(topicPresence, reinterpret_cast<const uint8_t*>("1"), 1, true);
         mqtt.subscribe(topicCmd, 1);
 
-        // Publish initial retained status frame immediately on connect
         TripPoint pt;
         bool isReal = false;
         if (buildCurrentTripPoint(pt, isReal)) {
@@ -502,14 +584,8 @@ void ensureMqttConnected() {
             encodeLiveTelemetryPlain(liveSeqNum++, pt, plain21);
             publishEncryptedPacket(topicStatus, plain21, LIVE_TELEMETRY_SIZE, true);
         }
-#if RELEASE_BUILD == 0
-        Serial.printf("[MQTT] Connected to %s:%d | TopicID=%s\n", SAFAR_MQTT_HOST, SAFAR_MQTT_PORT, topicId);
-#endif
     } else {
         digitalWrite(STATUS_LED_PIN, LOW);
-#if RELEASE_BUILD == 0
-        Serial.printf("[MQTT] Connect failed (rc=%d), retrying in 5s...\n", mqtt.state());
-#endif
     }
 }
 
@@ -521,6 +597,15 @@ void setup() {
     pinMode(STATUS_LED_PIN, OUTPUT);
     pinMode(SOS_CANCEL_PIN, INPUT_PULLUP);
     digitalWrite(STATUS_LED_PIN, LOW);
+
+    // PHASE F-A Task 4: Print active configuration flags once at boot
+    Serial.printf(
+        "[CFG] release=%d tls=%d demo=%d indoor=%d\n",
+        RELEASE_BUILD,
+        VERIFY_TLS,
+        DEMO_FAKE_GPS,
+        INDOOR_TABLE_FALLBACK
+    );
 
     // 1. Load 32-byte ChaCha20-Poly1305 key & derive 16-hex SHA-256 topic ID
     SafarCrypto::hexToBytes(SAFAR_SHARED_SECRET_HEX, sharedKey32, 32);
@@ -558,20 +643,13 @@ void setup() {
     configTime(0, 0, "pool.ntp.org", "time.google.com");
 
 #if VERIFY_TLS == 1
-    tlsClient.setCACert(SAFAR_MQTT_ROOT_CA_PEM);
+    tlsClient.setCACert(EMQX_CA_PEM);
 #else
     tlsClient.setInsecure();
 #endif
     mqtt.setServer(SAFAR_MQTT_HOST, SAFAR_MQTT_PORT);
     mqtt.setBufferSize(1024);
     mqtt.setCallback(onMqttMessage);
-
-#if RELEASE_BUILD == 0
-    Serial.println("[SAFAR 2.0] DEV BUILD READY (Commands: s=sync, f=clear flash)");
-    Serial.printf("[SAFAR 2.0] Topic ID: %s\n", topicId);
-#else
-    Serial.println("[SAFAR 2.0] RELEASE BUILD READY");
-#endif
 }
 
 void loop() {
@@ -592,14 +670,20 @@ void loop() {
         mqtt.loop();
     }
 
-    // 4. Progress stop-and-wait History Chunk Sync if active
+    // 4. Progress stop-and-wait History Chunk Sync if active (PHASE F-A Task 6: 10000ms timeout, max 3 retries)
     uint32_t now = millis();
     if (syncActive && mqtt.connected()) {
         if (!waitingForChunkAck) {
             sendCurrentHistoryChunk();
-        } else if (now - lastChunkSentMs >= 4000UL) {
-            // Retry current chunk after 4s timeout
-            sendCurrentHistoryChunk();
+        } else if (now - lastChunkSentMs >= HISTORY_ACK_TIMEOUT_MS) {
+            if (chunkRetryCount < HISTORY_MAX_RETRIES) {
+                chunkRetryCount++;
+                sendCurrentHistoryChunk();
+            } else {
+                syncActive = false;
+                waitingForChunkAck = false;
+                chunkRetryCount = 0;
+            }
         }
     }
 
@@ -610,14 +694,13 @@ void loop() {
         bool isRealGps = false;
         if (buildCurrentTripPoint(pt, isRealGps)) {
             if (isRealGps && isRiding) {
-                appendPointToFlash(pt);
+                appendPointToFlash(pt, isRealGps);
             }
             if (mqtt.connected()) {
                 uint8_t plain21[LIVE_TELEMETRY_SIZE];
                 encodeLiveTelemetryPlain(liveSeqNum++, pt, plain21);
                 publishEncryptedPacket(topicLive, plain21, LIVE_TELEMETRY_SIZE, false);
 
-                // Refresh retained status every 10 seconds
                 if (now - lastStatusPubMs >= 10000UL) {
                     lastStatusPubMs = now;
                     publishEncryptedPacket(topicStatus, plain21, LIVE_TELEMETRY_SIZE, true);
@@ -626,14 +709,14 @@ void loop() {
         }
     }
 
-    // 6. Crash / SOS Countdown state machine (P3-R6)
+    // 6. Crash / SOS Countdown state machine
     if (sosCountdownActive) {
         if (digitalRead(SOS_CANCEL_PIN) == LOW) {
             sosCountdownActive = false;
-            publishSosEvent(sosReason, 1); // state=1: Cancelled by rider
+            publishSosEvent(sosReason, 2); // state=2: Cancelled by rider
         } else if (now - sosStartMs >= 15000UL) {
             sosCountdownActive = false;
-            publishSosEvent(sosReason, 2); // state=2: SOS fired after 15s
+            publishSosEvent(sosReason, 3); // state=3: SOS fired after 15s
         }
     }
 
@@ -641,14 +724,11 @@ void loop() {
     if (Serial.available() > 0) {
         char ch = static_cast<char>(Serial.read());
         if (ch == 's') {
-            Serial.println("[DEV] Triggering History Sync from ts=0");
-            startHistorySync(0);
+            startSync(0);
         } else if (ch == 'f') {
-            Serial.println("[DEV] Clearing LittleFS flash log");
             clearFlashHistory();
         } else if (ch == 'c') {
-            Serial.println("[DEV] Triggering Crash SOS countdown (0x08)");
-            startSosCountdown(0);
+            startSosCountdown(1);
         }
     }
 #endif

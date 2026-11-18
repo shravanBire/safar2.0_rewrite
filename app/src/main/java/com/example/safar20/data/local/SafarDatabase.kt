@@ -17,7 +17,7 @@ import com.example.safar20.data.local.entity.TripSummaryEntity
         LocationPointEntity::class
     ],
     version = 1,
-    exportSchema = false
+    exportSchema = true
 )
 abstract class SafarDatabase : RoomDatabase() {
 
@@ -35,7 +35,6 @@ abstract class SafarDatabase : RoomDatabase() {
                     SafarDatabase::class.java,
                     "safar_database.db"
                 )
-                    .fallbackToDestructiveMigration()
                     .build()
                 INSTANCE = instance
                 instance

@@ -26,10 +26,14 @@ static const size_t CLEAR_FLASH_SIZE    = 10;  // 1B Opcode + 4B UpToTimestamp +
 static const size_t SET_EMERGENCY_SIZE  = 23;  // 1B Opcode + 1B Slot + 1B Len + 16B Number + 2B Seq + 2B CRC16
 static const size_t SOS_EVENT_SIZE      = 23;  // 1B Opcode + 16B TripPoint + 1B Reason + 1B State + 2B Seq + 2B CRC16
 
-// Minimum trusted epoch: 2024-01-01 00:00:00 UTC
-static const uint32_t MIN_TRUSTED_EPOCH = 1704067200UL;
-static const uint32_t HEARTBEAT_MAX_DRIFT_SEC   = 600UL; // P1-F2: ±600 s
-static const uint32_t CLEAR_FLASH_MAX_DRIFT_SEC = 120UL; // P1-F2: ±120 s
+// Minimum trusted epoch: > 1700000000 UTC (PHASE F-A Task 1)
+static const uint32_t MIN_TRUSTED_EPOCH        = 1700000000UL;
+static const uint32_t UNTRUSTED_FALLBACK_BASE  = 1762800000UL;
+static const uint32_t HEARTBEAT_MAX_DRIFT_SEC   = 600UL;   // PHASE F-A Task 3: ±600 s
+static const uint32_t CLEAR_FLASH_MAX_DRIFT_SEC = 120UL;   // PHASE F-A Task 3: ±120 s
+static const uint32_t FUTURE_CURSOR_MAX_DRIFT_S = 86400UL; // PHASE F-A Task 5: +86400 s
+static const uint32_t HISTORY_ACK_TIMEOUT_MS    = 10000UL; // PHASE F-A Task 6: 10000 ms
+static const uint8_t  HISTORY_MAX_RETRIES       = 3;       // PHASE F-A Task 6: max 3 retries
 
 #pragma pack(push, 1)
 struct TripPoint {
@@ -156,7 +160,7 @@ inline bool verifyPlainCrc16(const uint8_t* plain, size_t plainLen) {
     return expected == received;
 }
 
-// Encode 23-byte plain SOS Event packet (0x08 — P3-R6)
+// Encode 23-byte plain SOS Event packet (0x08)
 inline void encodeSosEventPlain(
     const TripPoint& pt,
     uint8_t reason,
@@ -173,56 +177,84 @@ inline void encodeSosEventPlain(
     writeU16LE(out23 + SOS_EVENT_SIZE - 2, crc);
 }
 
-// P1-F1 & P1-F2: Command sequence & freshness validation gated on timeTrusted
+// PHASE F-A Task 3: Command sequence & freshness validation
 struct CommandReplayState {
-    uint16_t lastCmdSeq   = 0;
-    bool     hasSeenCmd   = false;
+    uint16_t cmdSeq      = 0;
+    bool     cmdSeqValid = false;
 };
 
-inline bool isSeqNewer(uint16_t incomingSeq, CommandReplayState& state) {
-    if (!state.hasSeenCmd) {
-        state.lastCmdSeq = incomingSeq;
-        state.hasSeenCmd = true;
+enum CommandRejectReason {
+    CMD_ACCEPT = 0,
+    CMD_REJECT_STALE,
+    CMD_REJECT_REPLAY,
+    CMD_REJECT_UNTRUSTED_TIME
+};
+
+inline void resetCmdSeqOnOpenSession(uint16_t openSessionSeq, CommandReplayState& state) {
+    state.cmdSeq      = openSessionSeq;
+    state.cmdSeqValid = true;
+}
+
+inline bool isSeqNewerWindow(uint16_t incomingSeq, CommandReplayState& state) {
+    if (!state.cmdSeqValid) {
+        state.cmdSeq      = incomingSeq;
+        state.cmdSeqValid = true;
         return true;
     }
-    if (static_cast<int16_t>(incomingSeq - state.lastCmdSeq) > 0) {
-        state.lastCmdSeq = incomingSeq;
+    if (static_cast<int16_t>(incomingSeq - state.cmdSeq) > 0) {
+        state.cmdSeq = incomingSeq;
         return true;
     }
     return false;
 }
 
 inline bool isTimestampWithinDrift(uint32_t packetTs, uint32_t currentEpoch, uint32_t maxDriftSec) {
-    if (packetTs == 0 || currentEpoch < MIN_TRUSTED_EPOCH) return false;
+    if (packetTs == 0 || currentEpoch <= MIN_TRUSTED_EPOCH) return false;
     uint32_t diff = (packetTs > currentEpoch) ? (packetTs - currentEpoch) : (currentEpoch - packetTs);
     return diff <= maxDriftSec;
 }
 
 /**
- * P1-F2: Verify HEARTBEAT (0x05, ±600s) and CLEAR_FLASH (0x06, ±120s) freshness and sequence.
- * Enforced ONLY when timeTrusted is true.
+ * PHASE F-A Task 3: Validate command authenticity for HEARTBEAT, CLEAR_FLASH, and SET_EMERGENCY.
+ * - Sequence window (int16_t)(seq - cmdSeq) > 0 once cmdSeqValid applies to all three.
+ * - When timeTrusted: reject HEARTBEAT if |ts - epoch| > 600s, reject CLEAR_FLASH if |ts - epoch| > 120s.
+ * - CLEAR_FLASH additionally requires timeTrusted == true and allowRemoteClear == true.
  */
-inline bool verifyCommandFreshnessAndSeq(
+inline CommandRejectReason validateAuthenticatedCommand(
     uint8_t opcode,
     uint32_t packetTimestamp,
     uint16_t incomingSeq,
     bool timeTrusted,
+    bool allowRemoteClear,
     uint32_t currentEpoch,
     CommandReplayState& state
 ) {
-    if (!timeTrusted) {
-        return true;
-    }
-    if (!isSeqNewer(incomingSeq, state)) {
-        return false;
-    }
-    if (opcode == PKT_HEARTBEAT) {
-        return isTimestampWithinDrift(packetTimestamp, currentEpoch, HEARTBEAT_MAX_DRIFT_SEC);
-    }
     if (opcode == PKT_CLEAR_FLASH) {
-        return isTimestampWithinDrift(packetTimestamp, currentEpoch, CLEAR_FLASH_MAX_DRIFT_SEC);
+        if (!timeTrusted || !allowRemoteClear) {
+            return CMD_REJECT_UNTRUSTED_TIME;
+        }
+        if (!isTimestampWithinDrift(packetTimestamp, currentEpoch, CLEAR_FLASH_MAX_DRIFT_SEC)) {
+            return CMD_REJECT_STALE;
+        }
+    } else if (opcode == PKT_HEARTBEAT) {
+        if (timeTrusted && !isTimestampWithinDrift(packetTimestamp, currentEpoch, HEARTBEAT_MAX_DRIFT_SEC)) {
+            return CMD_REJECT_STALE;
+        }
     }
-    return true;
+
+    if (!isSeqNewerWindow(incomingSeq, state)) {
+        return CMD_REJECT_REPLAY;
+    }
+    return CMD_ACCEPT;
+}
+
+inline const char* rejectReasonToString(CommandRejectReason r) {
+    switch (r) {
+        case CMD_REJECT_STALE:          return "stale";
+        case CMD_REJECT_REPLAY:         return "replay";
+        case CMD_REJECT_UNTRUSTED_TIME: return "untrusted-time";
+        default:                        return "ok";
+    }
 }
 
 #endif // SAFAR_TYPES_H

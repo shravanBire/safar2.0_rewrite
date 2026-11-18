@@ -53,6 +53,9 @@ class SafarRepository(
     private val _sosEventStream = MutableSharedFlow<BinaryPacketCodec.SosEventPacket>(extraBufferCapacity = 16)
     val sosEventStream: SharedFlow<BinaryPacketCodec.SosEventPacket> = _sosEventStream.asSharedFlow()
 
+    private val _skippedInvalidPointsStream = MutableSharedFlow<Int>(extraBufferCapacity = 16)
+    val skippedInvalidPointsStream: SharedFlow<Int> = _skippedInvalidPointsStream.asSharedFlow()
+
     private val _completedRideSummary = MutableStateFlow<TripSummaryEntity?>(null)
     val completedRideSummary: StateFlow<TripSummaryEntity?> = _completedRideSummary.asStateFlow()
 
@@ -234,7 +237,9 @@ class SafarRepository(
     }
 
     suspend fun getLastSyncedTimestamp(deviceId: String): Long {
-        return tripDao.getLastSyncedTimestamp(deviceId) ?: 0L
+        val nowSec = System.currentTimeMillis() / 1000
+        val (minValid, maxValid) = TripMath.validTimestampBounds(nowSec)
+        return tripDao.getLastSyncedTimestamp(deviceId, minValid, maxValid) ?: 0L
     }
 
     // --- Actions ---
@@ -396,7 +401,17 @@ class SafarRepository(
         }
 
         return try {
-            val points = chunkPacket.tripPoints.sortedBy { it.timestamp }
+            val nowSec = System.currentTimeMillis() / 1000
+            val (validPoints, droppedCount) = TripMath.filterValidHistoryPoints(chunkPacket.tripPoints, nowSec)
+            if (droppedCount > 0) {
+                AppLog.i("Repo", "Dropped $droppedCount invalid history points")
+                _skippedInvalidPointsStream.tryEmit(droppedCount)
+            }
+            if (validPoints.isEmpty()) {
+                return true
+            }
+
+            val points = validPoints.sortedBy { it.timestamp }
             val minTs = points.first().timestamp
             val maxTs = points.last().timestamp
 
@@ -414,6 +429,7 @@ class SafarRepository(
             val canAppendToLatest = !firstPt.isTripStart &&
                     latestPoint != null &&
                     latestTrip != null &&
+                    !latestTrip.tripId.startsWith("DEMO_") &&
                     latestTrip.tripId == latestPoint.tripId &&
                     (firstPt.timestamp - latestPoint.timestamp) in 0..300
 
@@ -424,7 +440,7 @@ class SafarRepository(
             }
 
             val locationEntities = mutableListOf<LocationPointEntity>()
-            val tripPointsMap = mutableMapOf<String, MutableList<BinaryPacketCodec.ParsedTripPoint>>()
+            val tripPointsMap = LinkedHashMap<String, MutableList<BinaryPacketCodec.ParsedTripPoint>>()
 
             for (i in newPoints.indices) {
                 val pt = newPoints[i]
@@ -448,34 +464,18 @@ class SafarRepository(
                 )
             }
 
-            val tripSummariesToUpdate = mutableListOf<TripSummaryEntity>()
-            for ((tId, ptsAdded) in tripPointsMap) {
-                val existingPoints = tripDao.getPointsListForTrip(tId)
-                val allPointsForTrip = (existingPoints.map {
-                    BinaryPacketCodec.ParsedTripPoint(
-                        timestamp = it.timestamp,
-                        latitude = it.latitude,
-                        longitude = it.longitude,
-                        speedKmh = it.speedKmh,
-                        heading = it.heading,
-                        isIgnitionOn = true,
-                        isTripStart = false,
-                        isTripEnd = false,
-                        satCount = 8
-                    )
-                } + ptsAdded).sortedBy { it.timestamp }
+            val committedMaxTs = TripMath.computeValidSyncCursor(
+                locationEntities.map { it.tripId to it.timestamp },
+                nowSec
+            )
 
-                tripSummariesToUpdate.add(buildTripSummary(tId, deviceId, allPointsForTrip))
-            }
-
-            val committedMaxTs = newPoints.maxOf { it.timestamp }
-
-            tripDao.saveHistoryChunkTransactional(
+            val tripSummariesToUpdate = tripDao.saveHistoryChunkIncrementalTransactional(
                 deviceId = deviceId,
-                tripSummaries = tripSummariesToUpdate,
+                tripPointsMap = tripPointsMap,
                 locationPoints = locationEntities,
                 newLastSyncedTimestamp = committedMaxTs,
-                deviceDao = deviceDao
+                deviceDao = deviceDao,
+                buildNewTripSummary = ::buildTripSummary
             )
             if (chunkPacket.totalChunks <= 0 || chunkPacket.chunkId + 1 >= chunkPacket.totalChunks) {
                 val newestSummary = tripSummariesToUpdate.maxByOrNull { it.endTimestamp }

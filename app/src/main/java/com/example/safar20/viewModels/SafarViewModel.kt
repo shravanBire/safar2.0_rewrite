@@ -380,6 +380,15 @@ class SafarViewModel(
             }
         }
 
+        // Collect skipped invalid history point counts (Phase A2)
+        viewModelScope.launch {
+            repository.skippedInvalidPointsStream.collect { skippedCount ->
+                if (skippedCount > 0) {
+                    showTransientMessage("$skippedCount invalid points skipped")
+                }
+            }
+        }
+
         // Centralized debounced connection evaluator
         viewModelScope.launch {
             combine(

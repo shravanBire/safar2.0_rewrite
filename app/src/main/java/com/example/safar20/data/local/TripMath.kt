@@ -7,7 +7,7 @@ import kotlin.math.sin
 import kotlin.math.sqrt
 
 /**
- * Shared trip distance and speed math (P1-A5, P1-A6).
+ * Shared trip distance, speed, sync cursor bounds, and ingest sanity math (Phase A: A1, A2, A4, A6).
  * Filters standstill GPS jitter (< 3 m or both points speed == 0) and GPS teleports (> 250 km/h).
  */
 object TripMath {
@@ -16,6 +16,85 @@ object TripMath {
     const val MIN_MOVING_SPEED_KMH = 1.5f
     private const val MIN_SEGMENT_M = 3.0
     private const val MAX_IMPLIED_SPEED_KMH = 250.0
+
+    // Phase A1 / A2 constants: minValid = 1760000000 (2025-10-09 UTC), future tolerance = +86400s (1 day)
+    const val MIN_VALID_TIMESTAMP_SEC = 1760000000L
+    const val FUTURE_DRIFT_ALLOWANCE_SEC = 86400L
+
+    /**
+     * A1: Computes the valid [minValid, maxValid] timestamp bounds for a given current epoch (seconds).
+     */
+    fun validTimestampBounds(nowSec: Long): Pair<Long, Long> {
+        return MIN_VALID_TIMESTAMP_SEC to (nowSec + FUTURE_DRIFT_ALLOWANCE_SEC)
+    }
+
+    /**
+     * A1 / A6(1): Pure sync cursor selector used by tests and repository cursor validation.
+     * Ignores DEMO_ trips, timestamps < 1760000000, and timestamps > nowSec + 86400.
+     */
+    fun computeValidSyncCursor(
+        candidates: Iterable<Pair<String, Long>>,
+        nowSec: Long
+    ): Long {
+        val (minValid, maxValid) = validTimestampBounds(nowSec)
+        return candidates
+            .asSequence()
+            .filter { (tripId, ts) ->
+                !tripId.startsWith("DEMO_") && ts in minValid..maxValid
+            }
+            .maxOfOrNull { it.second } ?: 0L
+    }
+
+    /**
+     * A2 / A6(2): Validates whether a received history point is sane for storage.
+     * Drops points with timestamp outside [1760000000, nowSec + 86400],
+     * latitude outside [-90, 90], longitude outside [-180, 180], or (lat == 0.0 && lon == 0.0).
+     */
+    fun isValidHistoryPoint(point: ParsedTripPoint, nowSec: Long): Boolean {
+        val (minValid, maxValid) = validTimestampBounds(nowSec)
+        if (point.timestamp !in minValid..maxValid) return false
+        if (point.latitude.isNaN() || point.latitude < -90.0 || point.latitude > 90.0) return false
+        if (point.longitude.isNaN() || point.longitude < -180.0 || point.longitude > 180.0) return false
+        if (point.latitude == 0.0 && point.longitude == 0.0) return false
+        return true
+    }
+
+    /**
+     * A2 / A6(2): Filters a list of incoming history points, returning (validPoints, droppedCount).
+     */
+    fun filterValidHistoryPoints(
+        points: List<ParsedTripPoint>,
+        nowSec: Long
+    ): Pair<List<ParsedTripPoint>, Int> {
+        val valid = ArrayList<ParsedTripPoint>(points.size)
+        var dropped = 0
+        for (pt in points) {
+            if (isValidHistoryPoint(pt, nowSec)) {
+                valid.add(pt)
+            } else {
+                dropped++
+            }
+        }
+        return valid to dropped
+    }
+
+    /**
+     * A4 / A6(3): Incremental trip distance calculation.
+     * Adds the distance of (listOf(lastStoredPoint) + newPoints) to previousDistanceKm.
+     */
+    fun incrementalDistanceKm(
+        previousDistanceKm: Double,
+        lastStoredPoint: ParsedTripPoint?,
+        newPoints: List<ParsedTripPoint>
+    ): Double {
+        if (newPoints.isEmpty()) return previousDistanceKm
+        val chain = if (lastStoredPoint != null) {
+            listOf(lastStoredPoint) + newPoints
+        } else {
+            newPoints
+        }
+        return previousDistanceKm + distanceKm(chain)
+    }
 
     fun haversineMeters(lat1: Double, lon1: Double, lat2: Double, lon2: Double): Double {
         val dLat = Math.toRadians(lat2 - lat1)
